@@ -10,6 +10,8 @@ export interface Peer {
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  role: string | null;
+  status: "active" | "dead";
 }
 
 export interface Message {
@@ -29,6 +31,10 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  // Optional role claim. When set, the broker will reuse the peer ID previously
+  // bound to this role (if the prior holder is dead) or reject if a live peer
+  // currently holds it. Typically set from the CLAUDE_PEER_ROLE env var.
+  role?: string;
 }
 
 export interface RegisterResponse {
@@ -42,6 +48,11 @@ export interface HeartbeatRequest {
 export interface SetSummaryRequest {
   id: PeerId;
   summary: string;
+}
+
+export interface SetRoleRequest {
+  id: PeerId;
+  role: string | null; // null releases the current role
 }
 
 export interface ListPeersRequest {

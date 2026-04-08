@@ -158,6 +158,7 @@ Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
+- set_role: Claim a stable role name (e.g. 'overseer') so a future session with CLAUDE_PEER_ROLE=<role> inherits this peer ID
 - check_messages: Manually check for new messages
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
@@ -225,6 +226,22 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {},
+    },
+  },
+  {
+    name: "set_role",
+    description:
+      "Claim a stable role name (e.g. 'overseer', 'planner', 'reviewer'). When this session dies and a new session registers with the same role via the CLAUDE_PEER_ROLE environment variable, the broker will reuse the current peer ID. Only one active peer may hold a given role at a time. Pass null to release the current role.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        role: {
+          type: ["string", "null"] as const,
+          description:
+            "The role name to claim, or null to release the current role.",
+        },
+      },
+      required: ["role"],
     },
   },
 ];
@@ -356,6 +373,49 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "set_role": {
+      const { role } = args as { role: string | null };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>(
+          "/set-role",
+          { id: myId, role }
+        );
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to set role: ${result.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                role === null
+                  ? "Role released."
+                  : `Role set to '${role}'. This peer ID will be reused by future sessions registering with CLAUDE_PEER_ROLE=${role}.`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting role: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     case "check_messages": {
       if (!myId) {
         return {
@@ -458,10 +518,12 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  const role = process.env.CLAUDE_PEER_ROLE?.trim() || undefined;
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
+  if (role) log(`Role claim: ${role}`);
 
   // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
@@ -487,16 +549,19 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker. If CLAUDE_PEER_ROLE is set, the broker will either
+  //    revive the dead peer previously bound to that role (same ID returned) or
+  //    throw if another live peer currently holds it.
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    ...(role ? { role } : {}),
   });
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  log(`Registered as peer ${myId}${role ? ` (role: ${role})` : ""}`);
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
