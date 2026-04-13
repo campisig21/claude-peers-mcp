@@ -244,10 +244,11 @@ IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPO
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
 Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
+- list_peers: Discover other Claude Code instances (scope: machine/directory/repo). Note: this excludes your own row — use get_self_id to check your own identity.
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - set_role: Claim a stable role name (e.g. 'overseer') so a future session with CLAUDE_PEER_ROLE=<role> inherits this peer ID
+- get_self_id: Returns your own peer ID, PID, working directory, git root, and role
 - check_messages: Manually check for new messages
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
@@ -312,6 +313,15 @@ const TOOLS = [
     name: "check_messages",
     description:
       "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "get_self_id",
+    description:
+      "Returns this session's own peer ID, working directory, git root, and role. Use this to verify your identity — list_peers excludes your own row, so this is the only reliable way to check your own ID.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -503,6 +513,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+    }
+
+    case "get_self_id": {
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      const role = process.env.CLAUDE_PEER_ROLE?.trim() || null;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `ID: ${myId}`,
+              `PID: ${process.pid}`,
+              `CWD: ${myCwd}`,
+              `Git root: ${myGitRoot ?? "(none)"}`,
+              `Role: ${role ?? "(none)"}`,
+            ].join("\n"),
+          },
+        ],
+      };
     }
 
     case "check_messages": {

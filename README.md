@@ -63,10 +63,11 @@ The other Claude receives it immediately and responds.
 
 | Tool             | What it does                                                                                                     |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo`                                   |
+| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` (excludes your own row)           |
 | `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)                                    |
 | `set_summary`    | Describe what you're working on (visible to other peers)                                                         |
 | `set_role`       | Claim a stable role name (e.g. `overseer`) so the next session with `CLAUDE_PEER_ROLE=<role>` inherits this ID   |
+| `get_self_id`    | Returns your own peer ID, PID, working directory, git root, and role                                             |
 | `check_messages` | Manually check for messages (fallback if not using channel mode)                                                 |
 
 ## How it works
