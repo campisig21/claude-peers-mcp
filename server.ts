@@ -97,6 +97,7 @@ async function rawBrokerFetch<T>(path: string, body: unknown): Promise<T> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -356,10 +357,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+      const scope = (args as Record<string, unknown>)?.scope;
+      if (typeof scope !== "string" || !["machine", "directory", "repo"].includes(scope)) {
+        return {
+          content: [{ type: "text" as const, text: 'Invalid scope. Must be "machine", "directory", or "repo".' }],
+          isError: true,
+        };
+      }
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope,
+          scope: scope as "machine" | "directory" | "repo",
           cwd: myCwd,
           git_root: myGitRoot,
           exclude_id: myId,
@@ -411,7 +418,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const rawArgs = args as Record<string, unknown>;
+      const to_id = rawArgs?.to_id;
+      const message = rawArgs?.message;
+      if (typeof to_id !== "string" || to_id.trim() === "") {
+        return {
+          content: [{ type: "text" as const, text: 'Invalid to_id. Must be a non-empty string.' }],
+          isError: true,
+        };
+      }
+      if (typeof message !== "string" || message.trim() === "") {
+        return {
+          content: [{ type: "text" as const, text: 'Invalid message. Must be a non-empty string.' }],
+          isError: true,
+        };
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -421,7 +442,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       try {
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
           from_id: myId,
-          to_id,
+          to_id: to_id,
           text: message,
         });
         if (!result.ok) {
@@ -447,7 +468,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "set_summary": {
-      const { summary } = args as { summary: string };
+      const summary = (args as Record<string, unknown>)?.summary;
+      if (typeof summary !== "string") {
+        return {
+          content: [{ type: "text" as const, text: 'Invalid summary. Must be a string.' }],
+          isError: true,
+        };
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -473,7 +500,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "set_role": {
-      const { role } = args as { role: string | null };
+      const role = (args as Record<string, unknown>)?.role ?? null;
+      if (role !== null && typeof role !== "string") {
+        return {
+          content: [{ type: "text" as const, text: 'Invalid role. Must be a string or null.' }],
+          isError: true,
+        };
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
