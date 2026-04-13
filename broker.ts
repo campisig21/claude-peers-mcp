@@ -27,6 +27,10 @@ import type {
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 
+// Version fingerprint: hash of broker.ts content at startup. Lets MCP servers
+// detect when the running daemon is stale relative to the code on disk.
+const BROKER_VERSION = Bun.hash(await Bun.file(new URL("./broker.ts", import.meta.url).pathname).text()).toString(16);
+
 // --- Database setup ---
 
 const db = new Database(DB_PATH);
@@ -437,7 +441,11 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        return Response.json({
+          status: "ok",
+          peers: (selectAllPeers.all() as Peer[]).length,
+          version: BROKER_VERSION,
+        });
       }
       return new Response("claude-peers broker", { status: 200 });
     }

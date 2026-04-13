@@ -40,9 +40,59 @@ const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
+// Expected broker version: hash of broker.ts on disk. Compared against the
+// running daemon's /health response to detect stale brokers.
+const EXPECTED_BROKER_VERSION = Bun.hash(
+  await Bun.file(BROKER_SCRIPT).text()
+).toString(16);
+let brokerVersionWarned = false;
+
 // --- Broker communication ---
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+const HEAL_COOLDOWN_MS = 10_000;
+let lastHealAttempt = 0;
+let healInProgress: Promise<void> | null = null;
+
+function isConnectionError(e: unknown): boolean {
+  if (e instanceof TypeError) return true; // fetch throws TypeError on network failure
+  if (e instanceof Error) {
+    const msg = e.message.toLowerCase();
+    return msg.includes("econnrefused") ||
+      msg.includes("connection refused") ||
+      msg.includes("fetch failed") ||
+      msg.includes("unable to connect");
+  }
+  return false;
+}
+
+async function attemptSelfHeal(): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastHealAttempt < HEAL_COOLDOWN_MS) {
+    return false;
+  }
+
+  // Deduplicate concurrent heal attempts — poll, heartbeat, and tool calls
+  // can all fail at once when the broker goes down.
+  if (healInProgress) {
+    try { await healInProgress; return true; } catch { return false; }
+  }
+
+  lastHealAttempt = now;
+  log("Broker unreachable, attempting self-heal...");
+  healInProgress = ensureBroker();
+  try {
+    await healInProgress;
+    log("Self-heal succeeded — broker is back");
+    return true;
+  } catch (e) {
+    log(`Self-heal failed: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  } finally {
+    healInProgress = null;
+  }
+}
+
+async function rawBrokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -55,12 +105,51 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  try {
+    return await rawBrokerFetch<T>(path, body);
+  } catch (e) {
+    if (!isConnectionError(e)) throw e;
+
+    const healed = await attemptSelfHeal();
+    if (!healed) throw e;
+
+    // Retry once after successful heal
+    return await rawBrokerFetch<T>(path, body);
+  }
+}
+
 async function isBrokerAlive(): Promise<boolean> {
   try {
     const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+async function checkBrokerVersion(): Promise<void> {
+  try {
+    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return;
+    const data = await res.json() as { status: string; peers: number; version?: string };
+    if (!data.version) {
+      if (!brokerVersionWarned) {
+        log("WARNING: broker /health has no version field — daemon predates version check");
+        brokerVersionWarned = true;
+      }
+      return;
+    }
+    if (data.version !== EXPECTED_BROKER_VERSION) {
+      if (!brokerVersionWarned) {
+        log(`WARNING: broker version mismatch — running=${data.version} disk=${EXPECTED_BROKER_VERSION}. Broker daemon is stale.`);
+        brokerVersionWarned = true;
+      }
+    } else {
+      brokerVersionWarned = false; // Reset if versions match (e.g. after a restart healed it)
+    }
+  } catch {
+    // Non-critical
   }
 }
 
@@ -511,8 +600,9 @@ async function pollAndPushMessages() {
 // --- Startup ---
 
 async function main() {
-  // 1. Ensure broker is running
+  // 1. Ensure broker is running + check version parity
   await ensureBroker();
+  await checkBrokerVersion();
 
   // 2. Gather context
   myCwd = process.cwd();
@@ -584,7 +674,8 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat + periodic version check
+  let heartbeatCount = 0;
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
@@ -592,6 +683,10 @@ async function main() {
       } catch {
         // Non-critical
       }
+    }
+    // Check broker version every ~5 minutes (20 heartbeats × 15s)
+    if (++heartbeatCount % 20 === 0) {
+      await checkBrokerVersion();
     }
   }, HEARTBEAT_INTERVAL_MS);
 
