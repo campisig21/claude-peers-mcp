@@ -2,6 +2,38 @@
 
 Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
 
+## First-time machine setup (role framework)
+
+If you're setting up the claude-peers **role framework** (coordinator, planner,
+implementer, reviewer, auditor roles) on a new machine, run bootstrap once after
+cloning both repos:
+
+```bash
+# 1. Clone claude-peers-mcp to the canonical location
+git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp
+cd ~/claude-peers-mcp
+bun install
+
+# 2. Clone your project (e.g. multi-agent) and run bootstrap
+git clone <your-project-url>
+cd multi-agent
+./setup/bootstrap.sh
+```
+
+Bootstrap is idempotent — re-running on an already-configured machine prints
+"Everything already set up. 0 changes." and exits cleanly. Pass `--dry-run` to
+preview what it would do, `--force` to overwrite existing markdown files, and
+`--quiet` to suppress informational output.
+
+See `multi-agent/setup/README.md` for full bootstrap documentation.
+
+**How the mirror stays current:** `~/.claude/` is the live source of truth for
+role framework files. `claude-peers-mcp/global-claude-template/` and
+`vault-template/` are downstream mirrors that exist so fresh machines can reach
+the same state. Updates flow upstream → downstream via a manual re-sync (edit
+`~/.claude/`, then copy into the mirror and commit here). Never edit the mirror
+expecting it to propagate back.
+
 ```
   Terminal 1 (poker-engine)          Terminal 2 (eel)
   ┌───────────────────────┐          ┌──────────────────────┐

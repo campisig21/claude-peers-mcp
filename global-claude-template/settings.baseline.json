@@ -1,0 +1,45 @@
+{
+  "_comment": "Baseline settings for ~/.claude/settings.json. Installed by bootstrap/install-global-claude.sh on first run; deep-merged on subsequent runs (user values win, arrays deduplicated). Strip this comment key when merging into a live settings.json via jq. Personal API keys, projects/ references, and mcp-needs-auth-cache.json paths are intentionally excluded.",
+  "permissions": {
+    "allow": [
+      "Read(~/.claude/**)",
+      "Read(~/claude-peers-mcp/**)",
+      "Bash(bash ~/.claude/hooks/*:*)"
+    ],
+    "additionalDirectories": [
+      "~/.claude/roles",
+      "~/.claude/hooks",
+      "~/.claude/skills/vault-init",
+      "~/claude-peers-mcp"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/role-wakeup.sh",
+            "timeout": 15,
+            "statusMessage": "Loading role context..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/worktree-discipline.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "effortLevel": "high",
+  "autoMemoryEnabled": true,
+  "autoDreamEnabled": true
+}

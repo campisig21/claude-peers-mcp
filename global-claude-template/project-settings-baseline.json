@@ -1,0 +1,24 @@
+{
+  "_comment": "Deep-merged into <project>/.claude/settings.local.json by bootstrap. User additions preserved. permissions.allow is a union (baseline + current, deduped). Architect updates here propagate to all projects on next bootstrap re-run.",
+  "permissions": {
+    "allow": [
+      "Bash(codex exec:*)",
+      "Bash(git:*)",
+      "Bash(grep:*)",
+      "Skill(skill-codex:codex)",
+      "Read(.claude/**)",
+      "Read(setup/**)",
+      "Read(.githooks/**)",
+      "Read(vault/**)",
+      "Read(docs/superpowers/plans/**)",
+      "Bash(bash ./setup/*:*)",
+      "Bash(bash ./.githooks/*:*)",
+      "mcp__claude-peers__check_messages",
+      "mcp__claude-peers__get_self_id",
+      "mcp__claude-peers__list_peers",
+      "mcp__claude-peers__send_message",
+      "mcp__claude-peers__set_role",
+      "mcp__claude-peers__set_summary"
+    ]
+  }
+}
