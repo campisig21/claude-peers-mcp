@@ -136,6 +136,56 @@ switch (cmd) {
     break;
   }
 
+  case "send-by-role": {
+    const role = process.argv[3];
+    const msg = process.argv.slice(4).join(" ");
+    if (!role || !msg) {
+      console.error("Usage: bun cli.ts send-by-role <role> <message>");
+      console.error("       The role may be bare ('auditor') or namespaced ('multi-agent/auditor').");
+      process.exit(1);
+    }
+    const fromId = process.env.CLAUDE_PEERS_FROM_ID || "cli";
+    try {
+      const peers = await brokerFetch<Array<{ id: string; role: string | null }>>(
+        "/list-peers",
+        { scope: "machine", cwd: "/", git_root: null }
+      );
+      // Exact match first; if none, try suffix match for project-scoped roles
+      // so `send-by-role auditor` resolves `multi-agent/auditor`. Warn on ambiguity.
+      const exact = peers.filter((p) => p.role === role);
+      const suffix = exact.length > 0
+        ? exact
+        : peers.filter((p) => p.role?.endsWith(`/${role}`));
+      if (suffix.length === 0) {
+        console.error(`No active peer holds role '${role}'.`);
+        process.exit(2);
+      }
+      if (suffix.length > 1) {
+        console.error(
+          `Ambiguous: multiple peers hold a role matching '${role}':\n  ` +
+          suffix.map((p) => `${p.id} (${p.role})`).join("\n  ") +
+          "\nUse the fully-qualified role name (e.g. 'multi-agent/auditor')."
+        );
+        process.exit(3);
+      }
+      const target = suffix[0]!;
+      const result = await brokerFetch<{ ok: boolean; error?: string }>(
+        "/send-message",
+        { from_id: fromId, to_id: target.id, text: msg }
+      );
+      if (result.ok) {
+        console.log(`Message sent to ${target.id} (role: ${target.role})`);
+      } else {
+        console.error(`Failed: ${result.error}`);
+        process.exit(4);
+      }
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(5);
+    }
+    break;
+  }
+
   case "roles": {
     // Read the persisted DB directly — works even if the broker is dead,
     // which is the whole point of a forensic inspect command. The broker is

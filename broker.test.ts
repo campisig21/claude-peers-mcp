@@ -560,3 +560,105 @@ describe("Unregister", () => {
     await killPeer(procNewRecv);
   });
 });
+
+// ---- CLI send-by-role ----
+
+describe("CLI send-by-role", () => {
+  const cliScript = path.join(import.meta.dir, "cli.ts");
+
+  async function runCli(args: string[], env: Record<string, string> = {}): Promise<{
+    stdout: string; stderr: string; exitCode: number;
+  }> {
+    const proc = Bun.spawn(["bun", cliScript, ...args], {
+      env: { ...process.env, CLAUDE_PEERS_PORT: String(TEST_PORT), ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
+    return { stdout, stderr, exitCode };
+  }
+
+  test("resolves exact role match and sends message", async () => {
+    const role = "cli-exact-" + Date.now();
+    const { id, proc } = await registerPeer({ role });
+
+    const { stdout, exitCode } = await runCli([
+      "send-by-role", role, "hello via exact match",
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(id);
+
+    const { data: poll } = await brokerFetch<{ messages: { text: string; from_id: string }[] }>(
+      "/poll-messages", { id }
+    );
+    const found = poll.messages.find((m) => m.text === "hello via exact match");
+    expect(found).toBeDefined();
+    expect(found?.from_id).toBe("cli");
+
+    await brokerFetch("/unregister", { id });
+    await killPeer(proc);
+  });
+
+  test("resolves suffix match for namespaced roles (bare name)", async () => {
+    const suffix = "cli-suffix-" + Date.now();
+    const fullRole = `test-proj/${suffix}`;
+    const { id, proc } = await registerPeer({ role: fullRole });
+
+    const { stdout, exitCode } = await runCli([
+      "send-by-role", suffix, "hello via suffix match",
+    ]);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(id);
+
+    await brokerFetch("/unregister", { id });
+    await killPeer(proc);
+  });
+
+  test("exits 2 when no peer holds the requested role", async () => {
+    const { stderr, exitCode } = await runCli([
+      "send-by-role", "nonexistent-role-" + Date.now(), "will not deliver",
+    ]);
+    expect(exitCode).toBe(2);
+    expect(stderr).toMatch(/No active peer/);
+  });
+
+  test("exits 3 on ambiguous suffix match with multiple candidates", async () => {
+    const suffix = "cli-ambig-" + Date.now();
+    const { id: idA, proc: procA } = await registerPeer({ role: `proj-a/${suffix}` });
+    const { id: idB, proc: procB } = await registerPeer({ role: `proj-b/${suffix}` });
+
+    const { stderr, exitCode } = await runCli([
+      "send-by-role", suffix, "will fail",
+    ]);
+    expect(exitCode).toBe(3);
+    expect(stderr).toMatch(/Ambiguous/);
+
+    await brokerFetch("/unregister", { id: idA });
+    await brokerFetch("/unregister", { id: idB });
+    await killPeer(procA);
+    await killPeer(procB);
+  });
+
+  test("honors CLAUDE_PEERS_FROM_ID env var for hook attribution", async () => {
+    const role = "cli-fromid-" + Date.now();
+    const { id, proc } = await registerPeer({ role });
+
+    const { exitCode } = await runCli(
+      ["send-by-role", role, "hook-attributed message"],
+      { CLAUDE_PEERS_FROM_ID: "git-hook:post-merge" }
+    );
+    expect(exitCode).toBe(0);
+
+    const { data: poll } = await brokerFetch<{ messages: { text: string; from_id: string }[] }>(
+      "/poll-messages", { id }
+    );
+    const found = poll.messages.find((m) => m.text === "hook-attributed message");
+    expect(found?.from_id).toBe("git-hook:post-merge");
+
+    await brokerFetch("/unregister", { id });
+    await killPeer(proc);
+  });
+});

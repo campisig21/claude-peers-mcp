@@ -144,11 +144,21 @@ You can also inspect and interact from the command line:
 ```bash
 cd ~/claude-peers-mcp
 
-bun cli.ts status            # broker status + all peers
-bun cli.ts peers             # list peers
-bun cli.ts send <id> <msg>   # send a message into a Claude session
-bun cli.ts kill-broker       # stop the broker
+bun cli.ts status                        # broker status + all peers
+bun cli.ts peers                         # list peers
+bun cli.ts roles                         # persisted role bindings (active + dead)
+bun cli.ts send <id> <msg>               # send a message to a specific peer ID
+bun cli.ts send-by-role <role> <msg>     # send a message to whichever peer holds <role>
+bun cli.ts kill-broker                   # stop the broker
 ```
+
+`send-by-role` accepts either a bare role (`auditor`) or a namespaced role
+(`multi-agent/auditor`). Bare names match by suffix — if multiple peers hold
+matching roles across projects, the command exits non-zero and asks for the
+fully-qualified form. Useful for git hooks and other automation that needs
+to notify a role without knowing its current peer ID. Set
+`CLAUDE_PEERS_FROM_ID=<sender>` to tag the message source
+(e.g., `git-hook:post-merge`).
 
 ## Configuration
 
