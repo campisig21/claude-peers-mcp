@@ -98,3 +98,87 @@ export interface PollMessagesResponse {
   // as the since_id for a subsequent replay poll.
   next_cursor: number | null;
 }
+
+// --- A2A-lite types (Slice 3) ---
+//
+// These mirror the DB schema introduced in broker.ts's slice-3 DDL. No code
+// consumes them yet — they exist so Slice 4's handlers and any future CLI
+// audit view can type-check against a single source of truth.
+
+export type TaskState = "open" | "waiting" | "done" | "failed";
+
+export type TaskIntent =
+  | "dispatch"
+  | "state_change"
+  | "question"
+  | "answer"
+  | "complete"
+  | "cancel";
+
+export type RoleAtJoin =
+  | "dispatcher"
+  | "assignee"
+  | "reviewer"
+  | "collaborator"
+  | "observer";
+
+export interface Task {
+  id: string;
+  context_id: string | null;
+  state: TaskState;
+  title: string | null;
+  created_at: string; // ISO timestamp
+  created_by: PeerId;
+}
+
+export interface TaskParticipant {
+  task_id: string;
+  peer_id: PeerId;
+  role_at_join: RoleAtJoin | null;
+  joined_at: string; // ISO timestamp
+}
+
+export interface TaskEvent {
+  id: number;
+  task_id: string;
+  from_id: PeerId;
+  intent: TaskIntent;
+  text: string | null;
+  // Serialized JSON. Application layer parses via JSON.parse. Column is
+  // TEXT in SQLite; typed as `string | null` here rather than `unknown`
+  // so the serialization boundary is explicit in the type system.
+  data: string | null;
+  sent_at: string; // ISO timestamp
+}
+
+export interface TaskEventCursor {
+  peer_id: PeerId;
+  last_event_id: number;
+}
+
+// Shape of a row from the `audit_stream` view. Discriminated union by
+// `source`: 'message' rows always have `task_id === null` and `data === null`;
+// 'task_event' rows always have `to_id === null`.
+export type AuditStreamRow =
+  | {
+      source: "message";
+      source_id: number;
+      from_id: PeerId;
+      to_id: PeerId;
+      sent_at: string;
+      intent: "text";
+      task_id: null;
+      body: string;
+      data: null;
+    }
+  | {
+      source: "task_event";
+      source_id: number;
+      from_id: PeerId;
+      to_id: null;
+      sent_at: string;
+      intent: TaskIntent;
+      task_id: string;
+      body: string | null;
+      data: string | null;
+    };
