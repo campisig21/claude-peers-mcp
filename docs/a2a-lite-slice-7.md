@@ -126,8 +126,8 @@ Run S1 setup, replay once, replay again. Assert the file contents are identical 
 **S3: replay overwrites an existing file whose content drifted from DB.**
 Seed task T-1, pre-write `$TEST_HOME/tasks/T-1.md` with garbage content, run `replay T-1`. Assert file contents match rendered (garbage replaced).
 
-**S4: replay with task_id not in DB exits 2.**
-Seed empty DB. Run `replay T-999`. Assert exit code = 2. Assert stderr contains "T-999 not found".
+**S4: replay with task_id not in DB exits non-zero.**
+Seed empty DB. Run `replay T-999`. Assert `exit_code !== 0` (binary per D6). Assert stderr contains "T-999 not found".
 
 **S5: replay with invalid id exits 1.**
 Run `replay not-a-task-id`. Assert exit code = 1. Assert stderr contains "invalid task id".
@@ -167,7 +167,7 @@ This test locks in the "WAL readonly coexistence is safe" invariant. No assertio
 
 1. **Split into `replay.test.ts`** per D7 — same pattern as slice 5's `push-policy.test.ts`. Agree?
 2. **Subprocess-based CLI tests** — same pattern as slice 6's C1/C2 but simpler (no streaming). Use try/finally per test for cleanup. Agree?
-3. **Exit code matrix** per D6 — 0 success / 1 usage-or-config error / 2 task-not-found. Cleanly distinguishes user errors (1) from data-absence (2). Worth it, or collapse into 1 for all error paths?
+3. **Exit code matrix** — collapsed to binary per D6 after reviewer pre-flag #4 (task_id lookup is unambiguous; multi-code distinction adds no scripting value for this tool). Resolved pre-impl; preserved here for design-doc audit trail.
 4. **D3 race documentation-only** — no code-level coordination between running broker and replay CLI. Replay-while-running-broker is safe but may race the most-recent appendFile. For "perfect" sync, user kills broker first. Documented in help text. Acceptable?
 5. **D4 role-at-render-time semantic** — labels reflect current peers.role values, not history. Any concern about this subtly confusing users reading a replayed file for a task with rebinds? I lean "match broker runtime + document." Historical-accurate replay is a separate (unplanned) slice if ever needed.
 6. **No `--dry-run` in slice 7.** Add on user demand. Agree?
