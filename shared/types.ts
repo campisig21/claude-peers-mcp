@@ -32,6 +32,11 @@ export interface Event<P = unknown> {
   event_id: number;
   type: EventType;
   payload: P;
+  // Slice 5: whether the receiving MCP server should fire a channel
+  // notification (interrupt the session) or include-in-state-only.
+  // Absence == true (backwards-compat for slice-4 producers; slice-5+
+  // always sets it explicitly). See shared/push-policy.ts for the rules.
+  push?: boolean;
 }
 
 // --- Broker API types ---
@@ -162,6 +167,11 @@ export interface DispatchTaskRequest {
   from_id: PeerId;
   title: string;
   participants: string[]; // peer_ids OR role names
+  // Slice 5: optional overlay — resolved peer_ids in this array get
+  // role_at_join='observer' in task_participants. They receive delivery
+  // but never push (rule 1 in shouldPush). Dispatchers cannot observe
+  // their own tasks — if from_id appears here, the 'dispatcher' role wins.
+  observers?: string[];
   context_id?: string;
   text?: string;
   data?: Record<string, unknown>;
