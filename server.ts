@@ -691,8 +691,8 @@ async function main() {
     }
   })();
 
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  // Auto-summary is fully non-blocking — the summaryPromise.then(...) block
+  // further down applies the summary via /set-summary when it resolves.
 
   // 4. Register with broker. If CLAUDE_PEER_ROLE is set, the broker will either
   //    revive the dead peer previously bound to that role (same ID returned) or
