@@ -13,10 +13,18 @@
  */
 
 import { Database } from "bun:sqlite";
+import * as fsp from "node:fs/promises";
+import * as nodePath from "node:path";
+import { renderTaskFile } from "./shared/render.ts";
+import { parseTaskId } from "./shared/task-ids.ts";
+import type { Task, TaskParticipant, TaskEvent } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const CLAUDE_PEERS_HOME =
+  process.env.CLAUDE_PEERS_HOME ?? `${process.env.HOME}/.claude-peers`;
+const TASKS_DIR = nodePath.join(CLAUDE_PEERS_HOME, "tasks");
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
@@ -362,6 +370,128 @@ switch (cmd) {
     break;
   }
 
+  case "replay": {
+    // Slice 7: regenerate task file(s) from DB.
+    //
+    // Motivation is two-fold (both load-bearing):
+    //
+    //   (1) Crash recovery. If the broker dies between the DB insert for a
+    //       task_event and the subsequent fs.appendFile, the on-disk file
+    //       lags the DB. Replay regenerates from the DB-as-truth.
+    //
+    //   (2) Slice-4 M1 remediation: fs-write-order interleaving. If two
+    //       concurrent /send-task-event calls resolve their fs.appendFile
+    //       at differing speeds (M1 observation in slice-4 post-impl review,
+    //       decision-log), on-disk event order can temporarily diverge
+    //       from DB insertion order. Replay sorts by task_events.id ASC,
+    //       restoring the authoritative order.
+    //
+    // Opens the DB with { readonly: true } — safe against a concurrently
+    // running broker via bun:sqlite WAL mode. Overwrites existing files
+    // unconditionally (D2). Role labels use CURRENT peers.role values
+    // (D4) — if peers rebind after events were written, replay reflects
+    // the new role across all events. This is consistent with broker
+    // runtime behavior; users who need historical-accurate labels should
+    // snapshot the task file before any rebind.
+    const arg = process.argv[3];
+    if (!arg) {
+      console.error("Usage: bun cli.ts replay <task_id|all>");
+      console.error("       <task_id> format: T-<n>  (e.g. T-34)");
+      process.exit(1);
+    }
+
+    if (!(await Bun.file(DB_PATH).exists())) {
+      console.error(`No persisted peers database at ${DB_PATH}`);
+      process.exit(1);
+    }
+
+    const isAll = arg === "all";
+    if (!isAll && parseTaskId(arg) === null) {
+      console.error(`invalid task id: ${arg}. Expected 'T-<n>' or 'all'.`);
+      process.exit(1);
+    }
+
+    const db = new Database(DB_PATH, { readonly: true });
+    try {
+      // Belt-and-suspenders: sanity-check the connection is readonly by
+      // attempting a harmless write and confirming it throws. Guards
+      // against future refactors that accidentally pass write flags.
+      let readonlyConfirmed = false;
+      try {
+        db.run("CREATE TABLE _replay_readonly_probe (x INTEGER)");
+      } catch {
+        readonlyConfirmed = true;
+      }
+      if (!readonlyConfirmed) {
+        console.error("replay opened DB in write mode — aborting for safety");
+        process.exit(1);
+      }
+
+      // Peers schema may predate slice 4 if the broker has never run
+      // with slice-4+ code against this DB. Detect via pragma.
+      const tableCols = new Set(
+        (db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[])
+          .map((r) => r.name)
+      );
+      if (!tableCols.has("tasks") || !tableCols.has("task_events") || !tableCols.has("task_participants")) {
+        console.error("DB predates slice-4 schema (tasks/task_events/task_participants tables missing). Start the broker to migrate.");
+        process.exit(1);
+      }
+
+      // Build role lookup from the current peers table. Dead peers with a
+      // role contribute their role_at_render-time label; this matches the
+      // broker's runtime buildRoleLookup.
+      const roleRows = db
+        .query("SELECT id, role FROM peers WHERE role IS NOT NULL")
+        .all() as { id: string; role: string }[];
+      const roleMap = new Map(roleRows.map((r) => [r.id, r.role]));
+      const roleLookup = (peer_id: string): string | null => roleMap.get(peer_id) ?? null;
+
+      // Gather the tasks to replay.
+      let taskIds: string[];
+      if (isAll) {
+        const rows = db.query("SELECT id FROM tasks").all() as { id: string }[];
+        taskIds = rows.map((r) => r.id);
+        if (taskIds.length === 0) {
+          console.log("No tasks to replay.");
+          process.exit(0);
+        }
+      } else {
+        const row = db.query("SELECT id FROM tasks WHERE id = ?").get(arg) as
+          | { id: string }
+          | null;
+        if (!row) {
+          console.error(`task ${arg} not found`);
+          process.exit(1);
+        }
+        taskIds = [arg];
+      }
+
+      await fsp.mkdir(TASKS_DIR, { recursive: true });
+
+      let writtenCount = 0;
+      for (const tid of taskIds) {
+        const task = db.query("SELECT * FROM tasks WHERE id = ?").get(tid) as Task;
+        const participants = db
+          .query("SELECT * FROM task_participants WHERE task_id = ?")
+          .all(tid) as TaskParticipant[];
+        const events = db
+          .query("SELECT * FROM task_events WHERE task_id = ? ORDER BY id ASC")
+          .all(tid) as TaskEvent[];
+
+        const rendered = renderTaskFile(task, participants, events, roleLookup);
+        const filePath = nodePath.join(TASKS_DIR, `${tid}.md`);
+        await fsp.writeFile(filePath, rendered, { encoding: "utf8" });
+        console.log(`Replayed ${tid}`);
+        writtenCount++;
+      }
+      console.log(`Replayed ${writtenCount} task file(s).`);
+    } finally {
+      db.close();
+    }
+    break;
+  }
+
   case "tail": {
     // Live-tail the broker's SSE audit stream. Connects to /events/stream,
     // decodes each SSE frame, pretty-prints a one-liner per event. Exits
@@ -460,5 +590,12 @@ Usage:
   bun cli.ts messages all    Show full message history
   bun cli.ts send <id> <msg> Send a message to a peer
   bun cli.ts tail            Live-tail the broker's audit stream (SSE)
+  bun cli.ts replay <T-n>    Regenerate task file from DB (overwrites existing).
+                             Note: role labels use CURRENT peers.role values;
+                             replay OVERWRITES historical labels if peers
+                             have rebind'd since events were originally
+                             written. Commit tasks/ to git before replay if
+                             you need historical labels preserved.
+  bun cli.ts replay all      Regenerate every task file from DB
   bun cli.ts kill-broker     Stop the broker daemon`);
 }
