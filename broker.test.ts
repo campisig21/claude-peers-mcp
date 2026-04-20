@@ -1029,7 +1029,9 @@ describe("A2A-lite schema (Slice 3)", () => {
         ["context_id", "created_at", "created_by", "id", "state", "title"].sort()
       );
       expect(byName.id!.pk).toBe(1);
-      expect(byName.state!.dflt_value).toMatch(/'open'/);
+      // Exact-string match (reviewer C1) — tighter than a regex; catches any
+      // default-expression drift (e.g. wrapping parentheses, lowercased quote).
+      expect(byName.state!.dflt_value).toBe("'open'");
       expect(byName.created_at!.notnull).toBe(1);
       expect(byName.created_by!.notnull).toBe(1);
     } finally {
@@ -1048,8 +1050,12 @@ describe("A2A-lite schema (Slice 3)", () => {
       expect(Object.keys(byName).sort()).toEqual(
         ["joined_at", "peer_id", "role_at_join", "task_id"].sort()
       );
-      expect(byName.task_id!.pk).toBeGreaterThan(0);
-      expect(byName.peer_id!.pk).toBeGreaterThan(0);
+      // Composite PK ordering matters (reviewer C2): `(task_id, peer_id)` is
+      // the ordering that makes "find participants for task X" a direct index
+      // lookup — the dominant query pattern for slice 4+. Lock it in now;
+      // reordering later would be a breaking migration, not a reshape.
+      expect(byName.task_id!.pk).toBe(1);
+      expect(byName.peer_id!.pk).toBe(2);
     } finally {
       db.close();
     }
@@ -1182,6 +1188,58 @@ describe("A2A-lite schema (Slice 3)", () => {
         "SELECT COUNT(*) AS n FROM audit_stream WHERE source = 'task_event'"
       ).get() as { n: number };
       expect(row.n).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  // S9 (reviewer C3): restart the broker subprocess on the same DB and
+  // verify the slice-3 DDL block tolerates a re-run cleanly. CREATE IF NOT
+  // EXISTS is the migration mechanism — if a future refactor drops the
+  // idempotency (e.g. by adding a CREATE without IF NOT EXISTS), a restart
+  // against an existing DB would crash the broker at boot. This test locks
+  // in the restart-safety invariant. Uses the same module-scoped brokerProc
+  // reassignment pattern as T8 so afterAll still tears down cleanly.
+  test("S9: broker restart on existing slice-3 DB is idempotent", async () => {
+    brokerProc.kill();
+    await brokerProc.exited;
+
+    brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_PORT: String(TEST_PORT),
+        CLAUDE_PEERS_DB: TEST_DB,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    let ready = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        const res = await fetch(`${BROKER_URL}/health`);
+        if (res.ok) { ready = true; break; }
+      } catch { /* not yet up */ }
+    }
+    expect(ready).toBe(true);
+
+    // Schema survived the restart — reduced S1 check.
+    const db = openRo();
+    try {
+      const cols = db.query("PRAGMA table_info(tasks)").all() as Array<{
+        name: string;
+      }>;
+      const names = new Set(cols.map((c) => c.name));
+      expect(names.has("id")).toBe(true);
+      expect(names.has("state")).toBe(true);
+      expect(names.has("created_by")).toBe(true);
+
+      // Also confirm the view survives — it's the slice-3 addition most likely
+      // to break on a re-run if CREATE VIEW IF NOT EXISTS semantics change.
+      const v = db.query(
+        "SELECT 1 AS present FROM sqlite_master WHERE name = 'audit_stream'"
+      ).get() as { present: number } | null;
+      expect(v?.present).toBe(1);
     } finally {
       db.close();
     }
