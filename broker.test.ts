@@ -1585,10 +1585,18 @@ describe("A2A-lite typed tools (Slice 4)", () => {
       id: b.id,
       wait_ms: 5000,
     });
+    // Dangling-reject safety: if we bail early (e.g. dispatch 4xx in baseline),
+    // pollPromise still resolves at the broker's wait_ms timeout and must not
+    // surface as an "unhandled error between tests" at teardown.
+    pollPromise.catch(() => {});
     await new Promise((r) => setTimeout(r, 100));
 
     const t0 = Date.now();
-    await dispatchTask(a.id, [b.id]);
+    // Fail fast in baseline: assert dispatch succeeded before awaiting the
+    // long-poll resolution. Otherwise the test would block on pollPromise for
+    // the full 5s wait_ms, colliding with bun's default 5s per-test timeout.
+    const dispResp = await dispatchTask(a.id, [b.id]);
+    expect(dispResp.status).toBe(200);
     const { data } = await pollPromise;
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeLessThan(500);
@@ -1599,7 +1607,7 @@ describe("A2A-lite typed tools (Slice 4)", () => {
       await brokerFetch("/unregister", { id: p.id });
       await killPeer(p.proc);
     }
-  });
+  }, 15_000);
 
   test("P4: cursor advances past delivered events", async () => {
     const a = await registerPeer({ summary: "A" });
@@ -2007,8 +2015,10 @@ describe("A2A-lite typed tools (Slice 4)", () => {
       id: b.id,
       wait_ms: 5000,
     });
+    pollPromise.catch(() => {}); // dangling-reject safety (see P3)
     await new Promise((r) => setTimeout(r, 100));
-    await dispatchTask(a.id, [b.id]);
+    const dispResp = await dispatchTask(a.id, [b.id]);
+    expect(dispResp.status).toBe(200); // fail fast in baseline (see P3)
     const { data } = await pollPromise;
     expect(data.events.filter((e) => e.type === "task_event").length).toBe(1);
 
@@ -2024,7 +2034,7 @@ describe("A2A-lite typed tools (Slice 4)", () => {
       await brokerFetch("/unregister", { id: p.id });
       await killPeer(p.proc);
     }
-  });
+  }, 15_000);
 
   // F6 runs LAST in the slice-4 describe because it kills the broker and
   // respawns it (like T8). Later tests in the describe must not depend on
