@@ -107,6 +107,19 @@ In `pollAndPushMessages`'s task_event branch, skip the `mcp.notification` call w
 
 For message events, the server ignores `push` entirely (always pushes). If a future slice wants to suppress messages, it'll introduce an explicit opt-in — slice 5 stays focused on task_events.
 
+### D8. Appendix A counts corrected during Task 2.5 (I1 pins A=4, B=4, C=2, total=10)
+
+Parent spec §Appendix A summary ("impl=3, total=9, suppression=67%") is inconsistent with its own rule-by-event table. Re-derivation: impl receives pushes on events 1 (dispatch), 4 (answer reply_to_from=impl), 7 (reviewer state_change→done), and 8 (reviewer complete) — that's 4 pushes, not 3. Total across all three peers is 10, not 9. Parent spec's "9 events" count was also off — "event 9 task auto-closes" isn't a real event row.
+
+Resolution (co-decided with reviewer yb6oeqry during Task 2.5 pre-review):
+- Test `I1` asserts the rule-derived counts: A=4, B=4, C=2, total=10. Suppression ≈ 58% of possible receiver-event pairs, ≈ 63% of post-sender-exclusion deliveries.
+- Parent spec `docs/a2a-lite.md` §Appendix A gets an in-place correction in the same slice-5 branch: trim "9 events" to "8 events", update counts, add a spec-correction-history note explaining the fix-up.
+- The impact estimate in parent spec's "Impact Estimates" table ("~60-67% pushes suppressed per role") is still broadly accurate; the table-derived 58-63% fits within that range. No change to that table.
+
+### D9. R2 test scope documented explicitly (pre-review spot-check S3)
+
+`R2` — "sender-exclusion regression" — tests slice-4's delivery-layer filter (`te.from_id != ?` in `selectTaskEventsSincePeer`, sender-skip in `deliverTaskEventToPeer`). It does NOT exercise the `shouldPush` sender rule (D7), which is unreachable on this code path. Test name and comment updated to make this explicit so a future reader doesn't conclude R2 is testing shouldPush's sender branch.
+
 ### D7. Sender-exclusion rule in shouldPush is defense-in-depth, NOT the primary enforcement
 
 Slice 4 already excludes sender from delivery via `te.from_id != ?` in `selectTaskEventsSincePeer` and the sender-skip in `deliverTaskEventToPeer`. The shouldPush sender rule kicks in if a future slice accidentally delivers to the sender (e.g., someone removes the SQL filter). Keeping both layers makes the "sender never sees own event" invariant robust against single-site refactors.

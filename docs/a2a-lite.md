@@ -748,7 +748,7 @@ Add `bun cli.ts replay [task_id|all]` that regenerates `~/.claude-peers/tasks/<t
 
 Cycle: coordinator dispatches T-034 to impl-backend-A + reviewer-backend-A. Impl starts, asks a question, coordinator answers, impl completes, reviewer reviews, reviewer completes.
 
-**Events generated (9 total):**
+**Events generated (8 total — event 9 "task auto-closes" is not a real event row, removed in slice-5 fix-up):**
 
 1. `dispatch` from coordinator
 2. `state_change→working` from impl
@@ -756,11 +756,10 @@ Cycle: coordinator dispatches T-034 to impl-backend-A + reviewer-backend-A. Impl
 4. `answer (reply_to_from: impl)` from coordinator
 5. `state_change→done` from impl
 6. `state_change→working` from reviewer
-7. `state_change→done` from reviewer (or `complete`)
-8. `complete` from reviewer (optional; or the above)
-9. Task auto-closes
+7. `state_change→done` from reviewer
+8. `complete` from reviewer
 
-**Delivery** (all 9 events go to all 3 participants via cursor — universal delivery).
+**Delivery** (all 8 events go to all 3 non-sender positions via cursor — universal delivery minus sender).
 
 **Pushes** per participant (applying `shouldPush`):
 
@@ -775,7 +774,9 @@ Cycle: coordinator dispatches T-034 to impl-backend-A + reviewer-backend-A. Impl
 | 7 state_change→done | push | push | sender (no) |
 | 8 complete | push | push | sender (no) |
 
-**Pushes per role:** coord = 4, impl = 3, reviewer = 2. Total = 9 pushes delivered across 3 participants × 9 events = 27 possible; 9 actual. Suppression rate = 67%.
+**Pushes per role:** coord = 4 (events 3, 5, 7, 8), impl = 4 (events 1, 4, 7, 8), reviewer = 2 (events 1, 5). Total = 10 pushes. Receivers × events = 3 × 8 = 24 possible; sender-exclusion removes 8 (one per event); shouldPush suppresses an additional 6 (rule 3 twice × 2 receivers + rule 4 once + rule 5 once). 10 actual pushes of 24 theoretical = ~58% suppression (equivalent to 10/16 = ~63% of post-sender-exclusion deliveries). Slice-5 test `I1` locks in these specific counts (A=4, B=4, C=2, total=10).
+
+> **Spec correction history:** The original draft of this appendix reported impl=3 / total=9 / suppression=67% — those numbers were inconsistent with the rules applied to the table. Corrected during slice-5 Task 2.5 pre-review (reviewer re-derivation + independent implementer re-check). The event count was also trimmed from "9" to "8" since "Task auto-closes" isn't an emitted event.
 
 ## Appendix B — Rollback procedures
 
