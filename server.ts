@@ -36,7 +36,13 @@ import {
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
-const POLL_INTERVAL_MS = 1000;
+// Long-poll wait window. Matches (must be <=) broker's MAX_WAIT_MS.
+// Broker's default is also 30s, so not sending the field would work,
+// but we pass it explicitly as documentation of intent.
+const POLL_WAIT_MS = 30_000;
+// Backoff after a poll error before retrying — prevents tight error
+// loops when the broker is briefly unreachable.
+const POLL_ERROR_BACKOFF_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
@@ -568,20 +574,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
+        // wait_ms=0 is the fast path — returns immediately with whatever
+        // is queued. Critical for the check_messages tool: blocking here
+        // for 30s would stall the MCP worker.
+        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", {
+          id: myId,
+          wait_ms: 0,
+        });
+        const messages: Message[] = result.events
+          .filter((e) => e.type === "message")
+          .map((e) => e.payload);
+        if (messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
+        const lines = messages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
         );
         return {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -603,16 +618,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop for inbound messages ---
+// --- Long-poll driver ---
+//
+// pollAndPushMessages blocks on the broker for up to POLL_WAIT_MS via
+// /poll-messages' wait_ms param; the broker resolves the Promise
+// immediately when a message arrives for this peer. On timeout, the
+// broker returns an empty batch and the driver loop immediately
+// reconnects. On transient error (broker temporarily down), we back
+// off briefly before retrying — self-heal inside brokerFetch handles
+// the restart.
+
+let pollLoopActive = true;
 
 async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", {
+      id: myId,
+      wait_ms: POLL_WAIT_MS,
+    });
 
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
+    for (const event of result.events) {
+      // Slice 2 only emits type: "message". Slice 4 will expand to
+      // task_event; guard here so unknown types are safely ignored.
+      if (event.type !== "message") continue;
+      const msg: Message = event.payload;
+
+      // Look up the sender's info for channel envelope meta
       let fromSummary = "";
       let fromCwd = "";
       try {
@@ -647,8 +680,11 @@ async function pollAndPushMessages() {
       log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
+    // Broker might be down temporarily — brokerFetch's self-heal already
+    // fired. Back off briefly before the driver loop retries so we don't
+    // spin in a tight error loop if heal failed permanently.
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    await new Promise((r) => setTimeout(r, POLL_ERROR_BACKOFF_MS));
   }
 }
 
@@ -731,8 +767,17 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  // 6. Start the long-poll driver loop. Each call blocks on the broker for
+  //    up to POLL_WAIT_MS, resolving immediately when a message arrives.
+  //    On return (events, timeout, or transient error-with-backoff) the
+  //    loop re-enters pollAndPushMessages. Fire-and-forget — cleanup
+  //    flips pollLoopActive to false and awaits /unregister to unblock
+  //    the currently-in-flight poll.
+  (async () => {
+    while (pollLoopActive) {
+      await pollAndPushMessages();
+    }
+  })();
 
   // 7. Start heartbeat + periodic version check
   let heartbeatCount = 0;
@@ -750,9 +795,16 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
-  // 8. Clean up on exit
+  // 8. Clean up on exit.
+  //
+  // Ordering matters: flip pollLoopActive=false BEFORE /unregister. The
+  // /unregister call causes the broker to cancelWaiter on our behalf,
+  // which resolves the in-flight /poll-messages with an empty batch,
+  // which returns control to the driver loop, which checks the flag and
+  // exits. Without this ordering, process.exit(0) would race the still-
+  // blocked 30s long-poll; with it, the shutdown is near-instant.
   const cleanup = async () => {
-    clearInterval(pollTimer);
+    pollLoopActive = false;
     clearInterval(heartbeatTimer);
     if (myId) {
       try {
