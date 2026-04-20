@@ -2,6 +2,7 @@ import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import path from "path";
 import os from "os";
 import fs from "fs";
+import type { PollMessagesResponse } from "./shared/types.ts";
 
 const TEST_PORT = 17899;
 const TEST_DB = path.join(os.tmpdir(), `claude-peers-test-${Date.now()}.db`);
@@ -670,23 +671,9 @@ describe("CLI send-by-role", () => {
 // that's intentional per TDD. See docs/a2a-lite-slice-2.md §"Test Plan"
 // for the design rationale behind each test.
 
-type LongPollEvent = {
-  event_id: number;
-  type: "message" | "task_event";
-  payload: {
-    id: number;
-    from_id: string;
-    to_id: string;
-    text: string;
-    sent_at: string;
-    delivered: boolean | number;
-  };
-};
-
-type LongPollResponse = {
-  events: LongPollEvent[];
-  next_cursor: number | null;
-};
+// Long-poll response shape lives in shared/types.ts — single source of truth.
+// If Message or Event gains a field later, these tests automatically reflect it.
+type LongPollResponse = PollMessagesResponse;
 
 type DebugWaitersResponse = {
   size: number;
@@ -755,6 +742,11 @@ describe("Long-poll transport (Slice 2)", () => {
     expect(data.events.length).toBe(0);
     expect(data.next_cursor).toBe(null);
 
+    // G1: verify NO waiter was installed. Without this assertion, a buggy
+    // impl that installs-and-immediately-resolves on wait_ms=0 would pass.
+    const { data: debug } = await brokerFetch<DebugWaitersResponse>("/debug/waiters");
+    expect(debug.peers.find((p) => p.peer_id === aid)).toBeUndefined();
+
     await brokerFetch("/unregister", { id: aid });
     await killPeer(pa);
   });
@@ -779,6 +771,15 @@ describe("Long-poll transport (Slice 2)", () => {
     expect(data.events.length).toBe(2);
     expect(data.events.map((e) => e.payload.text)).toEqual(["m1", "m2"]);
 
+    // G2: verify messages were marked delivered (consumed). A second
+    // wait_ms=0 poll must return empty — catches "returns events but
+    // forgets markDelivered" bugs in isolation (without relying on T9).
+    const { data: d2 } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0 }
+    );
+    expect(d2.events.length).toBe(0);
+
     await brokerFetch("/unregister", { id: aid });
     await brokerFetch("/unregister", { id: bid });
     await killPeer(pa);
@@ -789,6 +790,7 @@ describe("Long-poll transport (Slice 2)", () => {
     const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t5-a" });
     const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t5-b" });
 
+    const poll1Started = Date.now();
     const poll1 = brokerFetch<LongPollResponse>(
       "/poll-messages",
       { id: aid, wait_ms: 5000 }
@@ -802,6 +804,11 @@ describe("Long-poll transport (Slice 2)", () => {
 
     // poll1 returns quickly — cancelled when poll2 installs its waiter
     const { data: d1 } = await poll1;
+    const poll1Elapsed = Date.now() - poll1Started;
+    // G3: distinguishes cancel-path from timeout-path. A buggy impl that
+    // failed to cancel poll1 would still return length=0 after 5000ms
+    // (timeout). 500ms bound is well under the 5000ms timeout.
+    expect(poll1Elapsed).toBeLessThan(500);
     expect(d1.events.length).toBe(0);
     expect(d1.next_cursor).toBe(null);
 
@@ -877,7 +884,9 @@ describe("Long-poll transport (Slice 2)", () => {
     const { data } = await pollPromise;
     const pollReturnedAt = Date.now();
 
-    expect(pollReturnedAt - unregisterStart).toBeLessThan(500);
+    // D1: unregister→cancel→resolve is the fast path — no timeout, no await.
+    // 100ms is generous for CI jitter but tight enough to lock in "fast path."
+    expect(pollReturnedAt - unregisterStart).toBeLessThan(100);
     expect(data.events.length).toBe(0);
     expect(data.next_cursor).toBe(null);
 
@@ -958,6 +967,24 @@ describe("Long-poll transport (Slice 2)", () => {
     await brokerFetch("/unregister", { id: bid });
     await killPeer(pa);
     await killPeer(pb);
+  });
+
+  test("T11 — wait_ms > MAX_WAIT_MS returns HTTP 400", async () => {
+    // G4: locks in the fail-loud contract from F4. Without this, a broker
+    // impl that silently clamps wait_ms down would violate the documented
+    // semantics while still passing all other tests. Pattern from the
+    // existing role-conflict test (broker.test.ts:206-225).
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t11-a" });
+
+    const { status, data: errData } = await brokerFetch<{ error: string }>(
+      "/poll-messages",
+      { id: aid, wait_ms: 999_999_999 }
+    );
+    expect(status).toBe(400);
+    expect(errData.error).toMatch(/MAX_WAIT_MS|wait_ms/i);
+
+    await brokerFetch("/unregister", { id: aid });
+    await killPeer(pa);
   });
 });
 
