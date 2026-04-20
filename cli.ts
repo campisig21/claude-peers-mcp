@@ -5,10 +5,11 @@
  * Utility commands for managing the broker and inspecting peers.
  *
  * Usage:
- *   bun cli.ts status          — Show broker status and all peers
- *   bun cli.ts peers           — List all peers
- *   bun cli.ts send <id> <msg> — Send a message to a peer
- *   bun cli.ts kill-broker     — Stop the broker daemon
+ *   bun cli.ts status            — Show broker status and all peers
+ *   bun cli.ts peers             — List all peers
+ *   bun cli.ts messages [id|all] — Show message history
+ *   bun cli.ts send <id> <msg>   — Send a message to a peer
+ *   bun cli.ts kill-broker       — Stop the broker daemon
  */
 
 import { Database } from "bun:sqlite";
@@ -271,6 +272,96 @@ switch (cmd) {
     break;
   }
 
+  case "messages": {
+    if (!(await Bun.file(DB_PATH).exists())) {
+      console.log(`No persisted peers database at ${DB_PATH}`);
+      break;
+    }
+
+    const db = new Database(DB_PATH, { readonly: true });
+    try {
+      const cols = new Set(
+        (db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name)
+      );
+      if (!cols.has("from_id") || !cols.has("to_id")) {
+        console.log("No messages table found (DB predates messaging — start the broker to migrate).");
+        break;
+      }
+
+      const peerArg = process.argv[3];
+      const showAll = peerArg === "all";
+      const peerId = peerArg && !showAll ? peerArg : null;
+      const limit = showAll ? null : 50;
+
+      // Build role lookup for display
+      const peerCols = new Set(
+        (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).map((c) => c.name)
+      );
+      const roleMap = new Map<string, string>();
+      if (peerCols.has("role")) {
+        const peers = db.query("SELECT id, role FROM peers WHERE role IS NOT NULL").all() as {
+          id: string;
+          role: string;
+        }[];
+        for (const p of peers) roleMap.set(p.id, p.role);
+      }
+
+      let query: string;
+      const params: string[] = [];
+      if (peerId) {
+        query = `SELECT * FROM messages WHERE from_id = ? OR to_id = ? ORDER BY sent_at DESC`;
+        params.push(peerId, peerId);
+        if (limit) query += ` LIMIT ${limit}`;
+      } else {
+        query = `SELECT * FROM messages ORDER BY sent_at DESC`;
+        if (limit) query += ` LIMIT ${limit}`;
+      }
+
+      const rows = db.query(query).all(...params) as Array<{
+        id: number;
+        from_id: string;
+        to_id: string;
+        text: string;
+        sent_at: string;
+        delivered: number;
+      }>;
+
+      if (rows.length === 0) {
+        console.log(peerId ? `No messages involving peer '${peerId}'.` : "No messages.");
+        break;
+      }
+
+      // Reverse so oldest-first for reading order
+      rows.reverse();
+
+      const label = (id: string) => {
+        const role = roleMap.get(id);
+        return role ? `${id} [${role}]` : id;
+      };
+
+      console.log(
+        peerId
+          ? `Messages involving ${label(peerId)} (${rows.length} shown):`
+          : `Messages (${rows.length} shown${!showAll ? ", latest 50 — use 'all' for full history" : ""}):`
+      );
+      console.log();
+
+      for (const m of rows) {
+        const status = m.delivered ? "✓" : "•";
+        const ts = m.sent_at.replace("T", " ").replace(/\.\d+Z$/, "Z");
+        console.log(`  ${status} ${ts}  ${label(m.from_id)} → ${label(m.to_id)}`);
+        const lines = m.text.split("\n");
+        for (const line of lines) {
+          console.log(`    ${line}`);
+        }
+        console.log();
+      }
+    } finally {
+      db.close();
+    }
+    break;
+  }
+
   case "kill-broker": {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
@@ -299,6 +390,9 @@ Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
   bun cli.ts roles           Show all persisted role bindings (active + dead)
+  bun cli.ts messages        Show recent messages (last 50)
+  bun cli.ts messages <id>   Messages to/from a specific peer
+  bun cli.ts messages all    Show full message history
   bun cli.ts send <id> <msg> Send a message to a peer
   bun cli.ts kill-broker     Stop the broker daemon`);
 }
