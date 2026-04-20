@@ -362,6 +362,71 @@ switch (cmd) {
     break;
   }
 
+  case "tail": {
+    // Live-tail the broker's SSE audit stream. Connects to /events/stream,
+    // decodes each SSE frame, pretty-prints a one-liner per event. Exits
+    // on stream close or SIGINT.
+    try {
+      const res = await fetch(`${BROKER_URL}/events/stream`);
+      if (!res.ok || !res.body) {
+        console.error(`Broker rejected tail: ${res.status}`);
+        process.exit(1);
+      }
+
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = "";
+
+      const sigHandler = async () => {
+        try { await reader.cancel(); } catch { /* already done */ }
+        process.exit(0);
+      };
+      process.on("SIGINT", sigHandler);
+      process.on("SIGTERM", sigHandler);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += value;
+        let idx = buf.indexOf("\n\n");
+        while (idx >= 0) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          idx = buf.indexOf("\n\n");
+
+          const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+          if (!dataLine) continue;
+          try {
+            const parsed = JSON.parse(dataLine.slice(5).trim());
+            const ts = typeof parsed?.payload?.sent_at === "string"
+              ? parsed.payload.sent_at.replace("T", " ").replace(/\.\d+Z$/, "Z")
+              : "";
+            if (parsed.type === "message") {
+              const p = parsed.payload as { from_id: string; to_id: string; text: string };
+              console.log(`${ts}  [message]    from ${p.from_id}  to ${p.to_id}  "${p.text}"`);
+            } else if (parsed.type === "task_event") {
+              const p = parsed.payload as {
+                task_id: string;
+                intent: string;
+                from_id: string;
+                text: string | null;
+              };
+              const textPart = p.text ? ` — ${p.text}` : "";
+              console.log(`${ts}  [task_event] ${p.task_id} ${p.intent} from ${p.from_id}${textPart}`);
+            } else {
+              console.log(`${ts}  [${parsed.type}]  ${dataLine.slice(5).trim()}`);
+            }
+          } catch (e) {
+            console.error(`[tail] frame parse error: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    }
+    break;
+  }
+
   case "kill-broker": {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
@@ -394,5 +459,6 @@ Usage:
   bun cli.ts messages <id>   Messages to/from a specific peer
   bun cli.ts messages all    Show full message history
   bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts tail            Live-tail the broker's audit stream (SSE)
   bun cli.ts kill-broker     Stop the broker daemon`);
 }

@@ -444,6 +444,77 @@ function cancelWaiter(id: PeerId): void {
   w.resolve({ events: [], next_cursor: null });
 }
 
+// --- SSE subscriber state (Slice 6) ---
+//
+// GET /events/stream subscribers are broadcast-only consumers that see
+// every event insert (message or task_event) as it's committed to the DB.
+// Subscribers do NOT participate in delivery semantics — no pendingWaiters
+// entry, no cursor advance, no delivered-flag flip. They are a forensic
+// tail for the broker's operator.
+
+type SseSubscriber = {
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  // Encoded once per subscriber so backpressure/close errors are isolated
+  // to the single subscriber that threw. (Not strictly required since the
+  // encoder is stateless for UTF-8, but keeps cleanup logic uniform.)
+  encoder: TextEncoder;
+};
+
+const sseSubscribers = new Set<SseSubscriber>();
+
+// Close the subscriber's controller and remove it from the set. Paired
+// operation — D10 cleanup invariant. Safe to call multiple times; the
+// controller's close() throws on a closed controller, caught and ignored.
+function removeSubscriber(sub: SseSubscriber): void {
+  sseSubscribers.delete(sub);
+  try { sub.controller.close(); } catch { /* already closed */ }
+}
+
+// Slice 6 D10: push value on SSE frames reflects only the receiver-
+// independent portion of shouldPush — currently just rule 3
+// (state_change→working universally suppressed). Rules 1 (observer),
+// 2 (sender), 4 (targeted question), 5 (targeted answer) require
+// receiver.peer_id and cannot be evaluated in a broadcast. The
+// semantic: "would this event push to a generic non-sender, non-target,
+// non-observer participant?"
+function ssePushValue(event: PeerEvent<Message | TaskEvent>): boolean {
+  if (event.type !== "task_event") return true;
+  const te = event.payload as TaskEvent;
+  if (te.intent === "state_change" && te.data) {
+    try {
+      const parsed = JSON.parse(te.data);
+      if (parsed?.to === "working") return false;
+    } catch { /* malformed data → default push */ }
+  }
+  return true;
+}
+
+// Broadcast an event to all active subscribers. Per-subscriber errors
+// are isolated (try/catch around the enqueue), and a throwing subscriber
+// is removed from the set so subsequent broadcasts skip it.
+//
+// Set iteration + delete-during-iteration is safe per ECMAScript: the
+// Set's iteration order is insertion-stable, and removing the current
+// element during forEach/for-of is well-defined. Subsequent elements
+// still visit normally.
+function broadcastToSubscribers(event: PeerEvent<Message | TaskEvent>): void {
+  if (sseSubscribers.size === 0) return;
+  // D10: SSE frame's push is the receiver-independent value, regardless
+  // of what the peer-directed poll response carried for the same event.
+  const sseFrame = { ...event, push: ssePushValue(event) };
+  const serialized = `data: ${JSON.stringify(sseFrame)}\n\n`;
+  for (const sub of sseSubscribers) {
+    try {
+      sub.controller.enqueue(sub.encoder.encode(serialized));
+    } catch (err) {
+      console.error(
+        `[claude-peers broker] SSE fan-out failed for subscriber: ${err instanceof Error ? err.message : String(err)}`
+      );
+      removeSubscriber(sub);
+    }
+  }
+}
+
 // --- Generate peer ID ---
 //
 // Peer IDs are human-readable adjective-noun pairs (e.g. "swift-comet").
@@ -661,6 +732,7 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     new Date().toISOString()
   );
   const insertedId = Number(insertResult.lastInsertRowid);
+  const row = selectMessageById.get(insertedId) as Message;
 
   // INVARIANT: no `await` between pendingWaiters.get and the delete+resolve
   // that follows. Atomicity here is the reason T6's concurrent-send test
@@ -671,15 +743,17 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   if (waiter) {
     clearTimeout(waiter.timeoutHandle);
     pendingWaiters.delete(body.to_id);
-
-    const row = selectMessageById.get(insertedId) as Message;
     markDelivered.run(row.id);
-
     waiter.resolve({
       events: [{ event_id: row.id, type: "message", payload: row }],
       next_cursor: row.id,
     });
   }
+
+  // Slice 6: SSE fan-out happens after DB commit AND after waiter resolve.
+  // Tail subscribers see every event including ones consumed by the
+  // long-poll waiter — see D7 (SSE is not a peer).
+  broadcastToSubscribers({ event_id: row.id, type: "message", payload: row, push: true });
 
   return { ok: true };
 }
@@ -934,6 +1008,11 @@ async function handleDispatchTask(
     deliverTaskEventToPeer(p, envelope);
   }
 
+  // Slice 6: SSE fan-out. D10 push-field semantic is applied inside
+  // broadcastToSubscribers (ssePushValue computes the receiver-independent
+  // value). Dispatch is not state_change→working, so push=true on SSE.
+  broadcastToSubscribers(envelope);
+
   return {
     task_id: taskId!,
     participants: allParticipants,
@@ -1010,6 +1089,9 @@ async function handleSendTaskEvent(
     if (p.peer_id === body.from_id) continue;
     deliverTaskEventToPeer(p, envelope);
   }
+
+  // Slice 6: SSE fan-out after waiter resolves.
+  broadcastToSubscribers(envelope);
 
   return { event_id: eventId };
 }
@@ -1122,6 +1204,50 @@ function handlePollMessages(body: PollMessagesRequest): Promise<PollMessagesResp
   });
 }
 
+// GET /events/stream — SSE tail. Opens a ReadableStream, registers the
+// controller as a subscriber, wires request.signal.abort to remove the
+// subscriber on client disconnect. Stream stays open until client cancels
+// or the broker shuts down.
+function handleEventsStream(req: Request): Response {
+  let subscriber: SseSubscriber | null = null;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      subscriber = { controller, encoder };
+      sseSubscribers.add(subscriber);
+      // Flush the response headers with an initial SSE comment frame.
+      // Required because Bun's fetch client closes the connection with
+      // ECONNRESET on empty-body streaming responses before any data
+      // arrives (observed locally against /events/stream when body
+      // starts silent). A leading `:` line is a comment per SSE spec —
+      // ignored by compliant consumers including the CLI parser.
+      controller.enqueue(encoder.encode(": claude-peers SSE tail\n\n"));
+    },
+    cancel() {
+      if (subscriber) removeSubscriber(subscriber);
+    },
+  });
+
+  // request.signal fires when the client disconnects. Wiring the listener
+  // AFTER subscriber registration ensures we always have the handle to
+  // remove, and avoids a race where the client drops before subscriber
+  // is assigned (stream.start runs synchronously in practice, but the
+  // defensive ordering is cheap insurance).
+  req.signal.addEventListener("abort", () => {
+    if (subscriber) removeSubscriber(subscriber);
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+
 function handleUnregister(body: { id: string }): void {
   // Cancel any pending long-poll waiter BEFORE marking dead so the poll
   // resolves with empty events. This closes the cleanup-latency window on
@@ -1162,7 +1288,18 @@ Bun.serve({
         const peers = Array.from(pendingWaiters.entries()).map(
           ([peer_id, w]) => ({ peer_id, age_ms: now - w.installedAt })
         );
-        return Response.json({ size: pendingWaiters.size, peers });
+        // Slice 6: additive field `sse_subscribers` — count of active
+        // /events/stream connections. Existing callers continue to read
+        // `size` + `peers` unchanged.
+        return Response.json({
+          size: pendingWaiters.size,
+          peers,
+          sse_subscribers: sseSubscribers.size,
+        });
+      }
+      // Slice 6: GET /events/stream — SSE tail.
+      if (path === "/events/stream") {
+        return handleEventsStream(req);
       }
       return new Response("claude-peers broker", { status: 200 });
     }
