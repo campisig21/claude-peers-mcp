@@ -40,6 +40,13 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 // Broker's default is also 30s, so not sending the field would work,
 // but we pass it explicitly as documentation of intent.
 const POLL_WAIT_MS = 30_000;
+// Client-side HTTP timeout for the long-poll request. Must exceed
+// POLL_WAIT_MS or the client aborts before the broker's waiter can
+// resolve — that's the exact bug PR #2's first codex pass caught:
+// a 5s default timeout was firing against a 30s server wait, silently
+// degrading effective poll cadence to ~6s. +5s buffer absorbs broker
+// scheduling jitter without risking false positives.
+const POLL_HTTP_TIMEOUT_MS = POLL_WAIT_MS + 5_000;
 // Backoff after a poll error before retrying — prevents tight error
 // loops when the broker is briefly unreachable.
 const POLL_ERROR_BACKOFF_MS = 1000;
@@ -98,12 +105,26 @@ async function attemptSelfHeal(): Promise<boolean> {
   }
 }
 
-async function rawBrokerFetch<T>(path: string, body: unknown): Promise<T> {
+// Default HTTP timeout for broker calls. Long-poll callers pass their own,
+// larger value via BrokerFetchOpts.timeoutMs since they legitimately block
+// for up to POLL_WAIT_MS on the broker side.
+const DEFAULT_BROKER_TIMEOUT_MS = 5000;
+
+type BrokerFetchOpts = {
+  timeoutMs?: number;
+};
+
+async function rawBrokerFetch<T>(
+  path: string,
+  body: unknown,
+  opts: BrokerFetchOpts = {}
+): Promise<T> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_BROKER_TIMEOUT_MS;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -112,9 +133,13 @@ async function rawBrokerFetch<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+async function brokerFetch<T>(
+  path: string,
+  body: unknown,
+  opts: BrokerFetchOpts = {}
+): Promise<T> {
   try {
-    return await rawBrokerFetch<T>(path, body);
+    return await rawBrokerFetch<T>(path, body, opts);
   } catch (e) {
     if (!isConnectionError(e)) throw e;
 
@@ -122,7 +147,7 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     if (!healed) throw e;
 
     // Retry once after successful heal
-    return await rawBrokerFetch<T>(path, body);
+    return await rawBrokerFetch<T>(path, body, opts);
   }
 }
 
@@ -634,10 +659,11 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", {
-      id: myId,
-      wait_ms: POLL_WAIT_MS,
-    });
+    const result = await brokerFetch<PollMessagesResponse>(
+      "/poll-messages",
+      { id: myId, wait_ms: POLL_WAIT_MS },
+      { timeoutMs: POLL_HTTP_TIMEOUT_MS }
+    );
 
     for (const event of result.events) {
       // Slice 2 only emits type: "message". Slice 4 will expand to

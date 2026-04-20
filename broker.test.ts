@@ -972,19 +972,31 @@ describe("Long-poll transport (Slice 2)", () => {
     await killPeer(pb);
   });
 
-  test("T11 — wait_ms > MAX_WAIT_MS returns HTTP 400", async () => {
+  test("T11 — wait_ms out-of-range returns HTTP 400 (both ends)", async () => {
     // G4: locks in the fail-loud contract from F4. Without this, a broker
-    // impl that silently clamps wait_ms down would violate the documented
+    // impl that silently clamps wait_ms would violate the documented
     // semantics while still passing all other tests. Pattern from the
     // existing role-conflict test (broker.test.ts:206-225).
+    //
+    // M2 extension: negative wait_ms is also rejected — fail-loud for both
+    // ends of the invalid range, symmetric with the > MAX_WAIT_MS branch.
     const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t11-a" });
 
-    const { status, data: errData } = await brokerFetch<{ error: string }>(
+    // Too-large wait_ms
+    const { status: tooBigStatus, data: tooBigErr } = await brokerFetch<{ error: string }>(
       "/poll-messages",
       { id: aid, wait_ms: 999_999_999 }
     );
-    expect(status).toBe(400);
-    expect(errData.error).toMatch(/MAX_WAIT_MS|wait_ms/i);
+    expect(tooBigStatus).toBe(400);
+    expect(tooBigErr.error).toMatch(/MAX_WAIT_MS|wait_ms/i);
+
+    // Negative wait_ms
+    const { status: negStatus, data: negErr } = await brokerFetch<{ error: string }>(
+      "/poll-messages",
+      { id: aid, wait_ms: -1 }
+    );
+    expect(negStatus).toBe(400);
+    expect(negErr.error).toMatch(/wait_ms/i);
 
     await brokerFetch("/unregister", { id: aid });
     await killPeer(pa);

@@ -209,11 +209,13 @@ const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
 
-// Used by handleSendMessage to fetch the just-inserted row. bun:sqlite's
-// last_insert_rowid() is scoped to this connection, so this is safe as long
-// as the INSERT and SELECT happen on the same `db` instance (they do).
-const selectJustInserted = db.prepare(`
-  SELECT * FROM messages WHERE id = last_insert_rowid()
+// Used by handleSendMessage to fetch the just-inserted row by its id.
+// Capturing the id from insertMessage.run().lastInsertRowid (rather than
+// calling SQLite's last_insert_rowid() later) avoids a fragility class:
+// any future write between the INSERT and this SELECT would return the
+// wrong row. Pass the id explicitly instead.
+const selectMessageById = db.prepare(`
+  SELECT * FROM messages WHERE id = ?
 `);
 
 // --- Long-poll waiter state ---
@@ -457,7 +459,16 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  // Capture the inserted row's id directly from the run result so any
+  // future intervening INSERT (e.g. an audit-log write added later) can't
+  // alias last_insert_rowid() and return the wrong message to the waiter.
+  const insertResult = insertMessage.run(
+    body.from_id,
+    body.to_id,
+    body.text,
+    new Date().toISOString()
+  );
+  const insertedId = Number(insertResult.lastInsertRowid);
 
   // INVARIANT: no `await` between pendingWaiters.get and the delete+resolve
   // that follows. Atomicity here is the reason T6's concurrent-send test
@@ -469,7 +480,7 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     clearTimeout(waiter.timeoutHandle);
     pendingWaiters.delete(body.to_id);
 
-    const row = selectJustInserted.get() as Message;
+    const row = selectMessageById.get(insertedId) as Message;
     markDelivered.run(row.id);
 
     waiter.resolve({
@@ -486,9 +497,16 @@ function handlePollMessages(body: PollMessagesRequest): Promise<PollMessagesResp
 
   // Fail loud on protocol misuse rather than silent clamp. BadRequestError
   // is mapped to HTTP 400 in the fetch handler; generic Error maps to 500.
+  // Both the > MAX and the < 0 branch stay consistent with F4's
+  // fail-loud-on-protocol-misuse philosophy.
   if (wait_ms !== undefined && wait_ms > MAX_WAIT_MS) {
     throw new BadRequestError(
       `wait_ms=${wait_ms} exceeds MAX_WAIT_MS=${MAX_WAIT_MS}`
+    );
+  }
+  if (wait_ms !== undefined && wait_ms < 0) {
+    throw new BadRequestError(
+      `wait_ms=${wait_ms} must be >= 0 (use 0 for fast-path)`
     );
   }
 
