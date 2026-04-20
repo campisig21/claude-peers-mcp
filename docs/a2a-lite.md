@@ -512,7 +512,7 @@ const lines = sorted.map((p) => {
 });
 ```
 
-The surrounding return block (`return { content: [{ type: "text", text: ... }] }`) stays the same; only the intermediate `lines` computation and the sort are new.
+The surrounding return block (`return { content: [{ type: "text", text: ... }] }`) retains its overall shape, but the `lines.join("\n\n")` at the end becomes `lines.join("\n")` — the new compact format is one line per peer, so a blank line between rows would just waste vertical space. The sort + `lines` computation are also new.
 
 - [ ] **Step 2: Typecheck**
 

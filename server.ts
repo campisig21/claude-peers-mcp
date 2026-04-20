@@ -708,19 +708,24 @@ async function main() {
   myId = reg.id;
   log(`Registered as peer ${myId}${role ? ` (role: ${role})` : ""}`);
 
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
+  // Always schedule the late-apply. The outer `if (!initialSummary)` guard
+  // we previously had here silently dropped the summary in the race where
+  // summaryPromise resolved DURING the /register await: initialSummary
+  // mutates via closure, the guard then flips false, and the .then never
+  // runs — broker stays empty. The inner check below is already idempotent
+  // (no-op when summary never produced a value), so scheduling
+  // unconditionally costs at most one redundant /set-summary in the
+  // "resolved before register" case.
+  summaryPromise.then(async () => {
+    if (initialSummary && myId) {
+      try {
+        await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+        log(`Late auto-summary applied: ${initialSummary}`);
+      } catch {
+        // Non-critical
       }
-    });
-  }
+    }
+  });
 
   // 5. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());
