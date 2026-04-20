@@ -248,7 +248,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude Code instances running on this machine. Returns their ID, working directory, git repo, and summary.",
+      "List active peer Claude instances. Excludes your own row — use get_self_id for that.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -265,7 +265,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send ad-hoc message to a peer by ID. Pushed immediately to their session.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -284,7 +284,7 @@ const TOOLS = [
   {
     name: "set_summary",
     description:
-      "Set a brief summary (1-2 sentences) of what you are currently working on. This is visible to other Claude Code instances when they list peers.",
+      "Set a 1-2 sentence summary of your current work, visible to peers.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -299,7 +299,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+      "Pull any unread messages manually. Fallback — messages normally arrive as channel pushes.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -308,7 +308,7 @@ const TOOLS = [
   {
     name: "get_self_id",
     description:
-      "Returns this session's own peer ID, working directory, git root, and role. Use this to verify your identity — list_peers excludes your own row, so this is the only reliable way to check your own ID.",
+      "Return your own peer ID, PID, cwd, git root, role. list_peers excludes your own row; use this for self-identity.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -317,7 +317,7 @@ const TOOLS = [
   {
     name: "set_role",
     description:
-      "Claim a stable role name (e.g. 'overseer', 'planner', 'reviewer'). When this session dies and a new session registers with the same role via the CLAUDE_PEER_ROLE environment variable, the broker will reuse the current peer ID. Only one active peer may hold a given role at a time. Pass null to release the current role.",
+      "Claim a stable role name. A future session with CLAUDE_PEER_ROLE=<role> inherits this peer ID on revival. Pass null to release.",
     inputSchema: {
       type: "object" as const,
       properties: {
