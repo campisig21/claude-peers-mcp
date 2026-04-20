@@ -23,6 +23,17 @@ export interface Message {
   delivered: boolean;
 }
 
+// Transport-agnostic event envelope. Used by long-poll (Slice 2) and
+// will be shared with SSE (Slice 6). Slice 2 only emits type: "message";
+// Slice 4 will add type: "task_event" with payload: TaskEvent.
+export type EventType = "message" | "task_event";
+
+export interface Event<P = unknown> {
+  event_id: number;
+  type: EventType;
+  payload: P;
+}
+
 // --- Broker API types ---
 
 export interface RegisterRequest {
@@ -71,8 +82,19 @@ export interface SendMessageRequest {
 
 export interface PollMessagesRequest {
   id: PeerId;
+  // Max milliseconds to long-poll before returning an empty batch.
+  // Default 30_000. Value 0 = fast path (return immediately).
+  // Values exceeding broker's MAX_WAIT_MS return HTTP 400.
+  wait_ms?: number;
+  // Replay mode: return events with id > since_id regardless of the
+  // `delivered` flag. Read-only — does NOT mark events delivered.
+  // When undefined, existing semantics apply (undelivered only, marked on return).
+  since_id?: number;
 }
 
 export interface PollMessagesResponse {
-  messages: Message[];
+  events: Event<Message>[];
+  // Max event_id in this batch, or null if empty. Caller may use this
+  // as the since_id for a subsequent replay poll.
+  next_cursor: number | null;
 }
