@@ -81,6 +81,96 @@ db.run(`
   )
 `);
 
+// --- A2A-lite schema (Slice 3) ---
+//
+// Additive landing pad for typed agent-to-agent events. No handler in the
+// broker produces rows in these tables yet — Slice 4 will add /dispatch-task
+// and /send-task-event. The audit_stream view is the stable consumer-facing
+// shape: callers read the unified feed without needing to know that
+// `messages` and `task_events` are physically separate tables.
+//
+// Foreign keys are declared but not enforced (broker.ts does not set
+// PRAGMA foreign_keys = ON). Treat the FK clauses as machine-readable
+// schema documentation rather than runtime guarantees.
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    context_id TEXT,
+    state TEXT NOT NULL DEFAULT 'open',
+    title TEXT,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    FOREIGN KEY (created_by) REFERENCES peers(id)
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS task_participants (
+    task_id TEXT NOT NULL,
+    peer_id TEXT NOT NULL,
+    role_at_join TEXT,
+    joined_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, peer_id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    FOREIGN KEY (peer_id) REFERENCES peers(id)
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS task_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    from_id TEXT NOT NULL,
+    intent TEXT NOT NULL,
+    text TEXT,
+    data TEXT,
+    sent_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id),
+    FOREIGN KEY (from_id) REFERENCES peers(id)
+  )
+`);
+
+db.run(`
+  CREATE INDEX IF NOT EXISTS idx_task_events_task
+    ON task_events(task_id, id)
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS task_event_cursors (
+    peer_id TEXT PRIMARY KEY,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (peer_id) REFERENCES peers(id)
+  )
+`);
+
+db.run(`
+  CREATE VIEW IF NOT EXISTS audit_stream AS
+    SELECT
+      id AS source_id,
+      'message' AS source,
+      from_id,
+      to_id,
+      sent_at,
+      'text' AS intent,
+      NULL AS task_id,
+      text AS body,
+      NULL AS data
+    FROM messages
+    UNION ALL
+    SELECT
+      id AS source_id,
+      'task_event' AS source,
+      from_id,
+      NULL AS to_id,
+      sent_at,
+      intent,
+      task_id,
+      text AS body,
+      data
+    FROM task_events
+`);
+
 // Mark stale peers as dead (PIDs that no longer exist). Runs on startup + interval.
 //
 // Dead rows are retained — not deleted — so that role bindings survive process
