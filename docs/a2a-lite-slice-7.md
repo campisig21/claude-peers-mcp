@@ -71,13 +71,23 @@ Documented as a known limitation — users who need strict historical fidelity c
 
 Scope creep. Add if users ask. Current behavior: always writes. Users who want to see output without side effects can redirect: `bun cli.ts replay T-34 && cat ~/.claude-peers/tasks/T-34.md`.
 
-### D6. Error modes — friendly, exit codes matter
+### D6. Error modes — binary exit code per reviewer pre-flag
+
+Updated per reviewer's Task-2.5 pre-flag #4: task_id lookup is unambiguous (unlike send-by-role which has ambiguity modes 2/3/4), so binary success/fail suffices for replay. Existing `cli.ts send-by-role` multi-code pattern does not apply.
 
 - `replay` with no args → usage message + exit 1.
 - `replay <bad-id>` where id doesn't match `/^T-\d+$/` and isn't "all" → "invalid task id: expected 'T-<n>' or 'all'" + exit 1.
-- `replay T-9999` where task doesn't exist in DB → "task T-9999 not found" + exit 2.
-- `replay all` with empty tasks table → "No tasks to replay." + exit 0 (not an error).
+- `replay T-9999` where task doesn't exist in DB → "task T-9999 not found" + exit 1.
+- `replay all` with empty tasks table → "No tasks to replay." + exit 0 (vacuous success).
 - DB file missing → "No persisted peers database at <path>" + exit 1 (consistent with existing `cli.ts roles` / `cli.ts messages`).
+
+Exit code 0 = all requested files written (or nothing to write on `all` + empty). Exit code 1 = any error. No distinction between config, usage, and missing-task — consumers read stderr for the specific message.
+
+### D8. Replay is the remediation for slice-4 M1 observation, not just crash recovery
+
+Reviewer's Task-2.5 pre-flag #5: slice 4's post-impl review surfaced observation M1 — fs-write-order interleaving can produce a task file with events temporarily in wrong-DB-order if two concurrent `/send-task-event` calls resolve their `fs.appendFile` at differing speeds. Runtime broker consistency with D3 (DB is ground truth) means the file is CORRECT-order-able but not CORRECTLY-ordered in the moment. M1 was logged as "slice 7's replay CLI regenerates from DB — not a fix requirement."
+
+Replay closes that loop: regenerating from `task_events WHERE task_id = ? ORDER BY id ASC` guarantees on-disk event order matches DB insertion order, correcting any M1 interleaving. Docstring comment in the `case "replay":` block cites M1 + slice-4's decision-log so future readers understand the two motivations (crash recovery + order cleanup) are both load-bearing.
 
 ### D7. Tests live in `replay.test.ts` (new file), mirroring `push-policy.test.ts` split
 
