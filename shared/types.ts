@@ -156,6 +156,35 @@ export interface TaskEventCursor {
   last_event_id: number;
 }
 
+// --- A2A-lite wire types (Slice 4) ---
+
+export interface DispatchTaskRequest {
+  from_id: PeerId;
+  title: string;
+  participants: string[]; // peer_ids OR role names
+  context_id?: string;
+  text?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface DispatchTaskResponse {
+  task_id: string;
+  participants: PeerId[];
+  event_id: number;
+}
+
+export interface SendTaskEventRequest {
+  from_id: PeerId;
+  task_id: string;
+  intent: "state_change" | "question" | "answer" | "complete" | "cancel";
+  text?: string;
+  data?: Record<string, unknown>;
+}
+
+export interface SendTaskEventResponse {
+  event_id: number;
+}
+
 // Shape of a row from the `audit_stream` view. Discriminated union by
 // `source`: 'message' rows always have `task_id === null` and `data === null`;
 // 'task_event' rows always have `to_id === null`.

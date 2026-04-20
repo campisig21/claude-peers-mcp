@@ -10,6 +10,8 @@
  */
 
 import { Database } from "bun:sqlite";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -23,10 +25,23 @@ import type {
   Peer,
   PeerId,
   Message,
+  Task,
+  TaskParticipant,
+  TaskEvent,
+  DispatchTaskRequest,
+  DispatchTaskResponse,
+  SendTaskEventRequest,
+  SendTaskEventResponse,
+  Event as PeerEvent,
 } from "./shared/types.ts";
+import { formatTaskId, parseTaskId } from "./shared/task-ids.ts";
+import { renderTaskFile, renderTaskEvent } from "./shared/render.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const CLAUDE_PEERS_HOME =
+  process.env.CLAUDE_PEERS_HOME ?? `${process.env.HOME}/.claude-peers`;
+const TASKS_DIR = path.join(CLAUDE_PEERS_HOME, "tasks");
 
 // Version fingerprint: hash of broker.ts content at startup. Lets MCP servers
 // detect when the running daemon is stale relative to the code on disk.
@@ -221,6 +236,11 @@ function purgeAncientDeadPeers() {
 purgeAncientDeadPeers();
 setInterval(purgeAncientDeadPeers, 24 * 60 * 60 * 1000);
 
+// --- Tasks directory ---
+// Ensure the audit directory exists at startup. `fs/promises.mkdir` recursive
+// mode is idempotent — safe on both fresh installs and existing deployments.
+await fs.mkdir(TASKS_DIR, { recursive: true });
+
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
@@ -306,6 +326,76 @@ const markDelivered = db.prepare(`
 // wrong row. Pass the id explicitly instead.
 const selectMessageById = db.prepare(`
   SELECT * FROM messages WHERE id = ?
+`);
+
+// --- A2A-lite prepared statements (Slice 4) ---
+
+// Task id lookup for sequential generation. `id` is TEXT (e.g. "T-10"),
+// so lexical sort would rank "T-10" before "T-9". We fetch all ids and
+// pick the max numerically in generateTaskId. Small-N is fine — typical
+// installations have dozens of tasks, and any future scale-up can swap in
+// a dedicated counter table.
+const selectAllTaskIds = db.prepare(`
+  SELECT id FROM tasks
+`);
+
+const insertTask = db.prepare(`
+  INSERT INTO tasks (id, context_id, state, title, created_at, created_by)
+  VALUES (?, ?, 'open', ?, ?, ?)
+`);
+
+const insertTaskParticipant = db.prepare(`
+  INSERT INTO task_participants (task_id, peer_id, role_at_join, joined_at)
+  VALUES (?, ?, ?, ?)
+`);
+
+const insertTaskEvent = db.prepare(`
+  INSERT INTO task_events (task_id, from_id, intent, text, data, sent_at)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const selectTaskById = db.prepare(`
+  SELECT * FROM tasks WHERE id = ?
+`);
+
+const selectTaskEventById = db.prepare(`
+  SELECT * FROM task_events WHERE id = ?
+`);
+
+const selectTaskParticipants = db.prepare(`
+  SELECT * FROM task_participants WHERE task_id = ?
+`);
+
+const selectTaskParticipantExists = db.prepare(`
+  SELECT 1 AS present FROM task_participants WHERE task_id = ? AND peer_id = ?
+`);
+
+const selectTaskEvents = db.prepare(`
+  SELECT * FROM task_events WHERE task_id = ? ORDER BY id ASC
+`);
+
+// Task events the polling peer should receive: id > cursor AND peer is a
+// participant on the event's task. Ordered by id ASC so next_cursor is
+// monotonic with the tail of the batch.
+const selectTaskEventsSincePeer = db.prepare(`
+  SELECT te.* FROM task_events te
+  INNER JOIN task_participants tp ON tp.task_id = te.task_id
+  WHERE tp.peer_id = ? AND te.id > ? AND te.from_id != ?
+  ORDER BY te.id ASC
+`);
+
+const selectTaskEventCursor = db.prepare(`
+  SELECT last_event_id FROM task_event_cursors WHERE peer_id = ?
+`);
+
+const upsertTaskEventCursor = db.prepare(`
+  INSERT INTO task_event_cursors (peer_id, last_event_id) VALUES (?, ?)
+  ON CONFLICT(peer_id) DO UPDATE SET last_event_id = excluded.last_event_id
+  WHERE excluded.last_event_id > task_event_cursors.last_event_id
+`);
+
+const selectPeerRoles = db.prepare(`
+  SELECT id, role FROM peers WHERE role IS NOT NULL
 `);
 
 // --- Long-poll waiter state ---
@@ -582,6 +672,294 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
+// --- A2A-lite handlers (Slice 4) ---
+
+// Build a role→peer_id lookup from the current peers table.
+// Used by render functions to annotate participant rows with `[role]`.
+function buildRoleLookup(): (peer_id: string) => string | null {
+  const rows = selectPeerRoles.all() as { id: string; role: string }[];
+  const map = new Map(rows.map((r) => [r.id, r.role]));
+  return (peer_id: string) => map.get(peer_id) ?? null;
+}
+
+// Resolve a participants array — a mix of peer IDs and role names — to
+// peer IDs. Role entries must match exactly one live peer.
+//
+// Invariant: /set-role at broker.ts's handleSetRole rejects live-role
+// conflicts (two active peers cannot hold the same role). So a role
+// lookup here either returns zero or one row; ambiguity is structurally
+// prevented upstream. If you're reading this later and considering
+// relaxing that invariant, you'll need to add tiebreak logic here.
+function resolveParticipants(raw: string[]): PeerId[] {
+  const resolved: PeerId[] = [];
+  for (const entry of raw) {
+    // Try peer_id first (active peers only).
+    const byId = db.query(
+      "SELECT id FROM peers WHERE id = ? AND status = 'active'"
+    ).get(entry) as { id: string } | null;
+    if (byId) {
+      resolved.push(byId.id);
+      continue;
+    }
+    // Fall through to role lookup.
+    const byRole = db.query(
+      "SELECT id FROM peers WHERE role = ? AND status = 'active'"
+    ).get(entry) as { id: string } | null;
+    if (byRole) {
+      resolved.push(byRole.id);
+      continue;
+    }
+    // Check for a DEAD role holder — improves the error message.
+    const deadHolder = db.query(
+      "SELECT id FROM peers WHERE role = ? AND status = 'dead' ORDER BY last_seen DESC LIMIT 1"
+    ).get(entry) as { id: string } | null;
+    if (deadHolder) {
+      throw new BadRequestError(
+        `role '${entry}' not found (held by dead peer ${deadHolder.id}; reclaim by starting a session with CLAUDE_PEER_ROLE=${entry})`
+      );
+    }
+    throw new BadRequestError(
+      `participant '${entry}' is neither an active peer id nor a live role name`
+    );
+  }
+  return resolved;
+}
+
+function generateTaskId(): string {
+  const rows = selectAllTaskIds.all() as { id: string }[];
+  let max = 0;
+  for (const r of rows) {
+    const n = parseTaskId(r.id);
+    if (n !== null && n > max) max = n;
+  }
+  return formatTaskId(max + 1);
+}
+
+function formatEventEnvelope(event: TaskEvent): PeerEvent<TaskEvent> {
+  return { event_id: event.id, type: "task_event", payload: event };
+}
+
+// Synchronously write the initial task markdown file. Logs to stderr on
+// failure and continues — the DB is ground truth per D3; slice 7's
+// `cli.ts replay` regenerates missing or stale files from DB state.
+async function writeDispatchFile(
+  task: Task,
+  participants: TaskParticipant[],
+  events: TaskEvent[]
+): Promise<void> {
+  try {
+    const rendered = renderTaskFile(task, participants, events, buildRoleLookup());
+    const filePath = path.join(TASKS_DIR, `${task.id}.md`);
+    await fs.writeFile(filePath, rendered, { encoding: "utf8" });
+  } catch (err) {
+    console.error(
+      `[claude-peers broker] audit write failed for ${task.id}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+// Append a rendered event to an existing task file. Log on failure + return.
+async function appendTaskEventFile(
+  taskId: string,
+  event: TaskEvent,
+  participants: TaskParticipant[]
+): Promise<void> {
+  try {
+    const rendered = renderTaskEvent(event, participants, buildRoleLookup());
+    const filePath = path.join(TASKS_DIR, `${taskId}.md`);
+    await fs.appendFile(filePath, `\n\n${rendered}\n`, { encoding: "utf8" });
+  } catch (err) {
+    console.error(
+      `[claude-peers broker] audit write failed for ${taskId} event ${event.id}: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+// Deliver a task_event to a single receiver: if they have a pending long-poll
+// waiter, resolve it with the event and advance their cursor atomically. If
+// they don't have a waiter, we do NOT advance their cursor here — their next
+// poll will pick it up via selectTaskEventsSincePeer and advance at delivery
+// time. INVARIANT: cursor write and waiter resolve are paired — C5 locks
+// this in. The cursor upsert is synchronous (bun:sqlite is sync) and no
+// await sits between the upsert and the resolve call, so the next poll
+// from this peer cannot see the event as unread.
+function deliverTaskEventToPeer(peerId: PeerId, event: PeerEvent<TaskEvent>): void {
+  const waiter = pendingWaiters.get(peerId);
+  if (!waiter) return;
+  clearTimeout(waiter.timeoutHandle);
+  pendingWaiters.delete(peerId);
+  upsertTaskEventCursor.run(peerId, event.event_id);
+  waiter.resolve({
+    events: [event],
+    next_cursor: event.event_id,
+  });
+}
+
+// Dispatch a new task. Creates tasks, task_participants, first task_events
+// row (intent='dispatch'), writes the audit file, and resolves waiters for
+// non-sender participants.
+//
+// D10 footnote: if a role participant resolves to a peer_id that previously
+// held the role and was later reclaimed by a new session (via revive), the
+// new session inherits participation — this is intentional (role identity
+// is stable across revives). See docs/a2a-lite-slice-4.md §D10.
+async function handleDispatchTask(
+  body: DispatchTaskRequest
+): Promise<DispatchTaskResponse> {
+  if (!body.from_id) {
+    throw new BadRequestError("from_id is required");
+  }
+  if (!body.title || typeof body.title !== "string") {
+    throw new BadRequestError("title is required");
+  }
+  if (!Array.isArray(body.participants) || body.participants.length === 0) {
+    throw new BadRequestError("participants must be a non-empty array");
+  }
+  const fromActive = db.query(
+    "SELECT id FROM peers WHERE id = ? AND status = 'active'"
+  ).get(body.from_id) as { id: string } | null;
+  if (!fromActive) {
+    throw new BadRequestError(`from_id '${body.from_id}' is not an active peer`);
+  }
+
+  const resolved = resolveParticipants(body.participants);
+  // Ensure the dispatcher is in the participants set. If they omitted
+  // themselves, insert at position 0.
+  const participantsSet = new Set<PeerId>(resolved);
+  participantsSet.add(body.from_id);
+  const allParticipants = Array.from(participantsSet);
+
+  const now = new Date().toISOString();
+  const dataStr = body.data ? JSON.stringify(body.data) : null;
+
+  // Single transaction: generate id + INSERT task + INSERT participants +
+  // INSERT first task_event. bun:sqlite is synchronous — no await between
+  // generateTaskId's SELECT MAX and the final INSERT — so sequential IDs
+  // (D7) are safe even under concurrent /dispatch-task arrivals. Future
+  // refactors introducing async inside this block MUST wrap the ID+INSERT
+  // in a compare-and-swap or serial queue.
+  let taskId: string;
+  let eventId: number;
+  let taskRow: Task;
+  let participantRows: TaskParticipant[];
+  let eventRow: TaskEvent;
+
+  const txn = db.transaction(() => {
+    taskId = generateTaskId();
+    insertTask.run(taskId, body.context_id ?? null, body.title, now, body.from_id);
+    for (const p of allParticipants) {
+      const role = p === body.from_id ? "dispatcher" : null;
+      insertTaskParticipant.run(taskId, p, role, now);
+    }
+    const evRes = insertTaskEvent.run(
+      taskId,
+      body.from_id,
+      "dispatch",
+      body.text ?? null,
+      dataStr,
+      now
+    );
+    eventId = Number(evRes.lastInsertRowid);
+  });
+  txn();
+
+  taskRow = selectTaskById.get(taskId!) as Task;
+  participantRows = selectTaskParticipants.all(taskId!) as TaskParticipant[];
+  eventRow = selectTaskEventById.get(eventId!) as TaskEvent;
+
+  // FS write happens AFTER DB commit. If it fails, DB is still consistent;
+  // slice 7 replay can regenerate the file. writeDispatchFile swallows
+  // errors internally (logs to stderr).
+  await writeDispatchFile(taskRow, participantRows, [eventRow]);
+
+  // Resolve waiters for all non-sender participants (slice 4: sender never
+  // receives their own event; slice 5 adds the full shouldPush filter).
+  const envelope = formatEventEnvelope(eventRow);
+  for (const p of allParticipants) {
+    if (p === body.from_id) continue;
+    deliverTaskEventToPeer(p, envelope);
+  }
+
+  return {
+    task_id: taskId!,
+    participants: allParticipants,
+    event_id: eventId!,
+  };
+}
+
+async function handleSendTaskEvent(
+  body: SendTaskEventRequest
+): Promise<SendTaskEventResponse> {
+  if (!body.from_id) throw new BadRequestError("from_id is required");
+  if (!body.task_id) throw new BadRequestError("task_id is required");
+  if (!body.intent) throw new BadRequestError("intent is required");
+
+  const allowedIntents = new Set([
+    "state_change",
+    "question",
+    "answer",
+    "complete",
+    "cancel",
+  ]);
+  if (!allowedIntents.has(body.intent)) {
+    throw new BadRequestError(
+      `intent '${body.intent}' not allowed on /send-task-event (dispatch lives on /dispatch-task)`
+    );
+  }
+
+  const fromActive = db.query(
+    "SELECT id FROM peers WHERE id = ? AND status = 'active'"
+  ).get(body.from_id) as { id: string } | null;
+  if (!fromActive) {
+    throw new BadRequestError(`from_id '${body.from_id}' is not an active peer`);
+  }
+
+  const task = selectTaskById.get(body.task_id) as Task | null;
+  if (!task) {
+    throw new BadRequestError(`task_id '${body.task_id}' not found`);
+  }
+
+  const isParticipant = selectTaskParticipantExists.get(body.task_id, body.from_id) as
+    | { present: number }
+    | null;
+  if (!isParticipant) {
+    throw new BadRequestError(
+      `from_id '${body.from_id}' is not a participant on task ${body.task_id}`
+    );
+  }
+
+  const hasText = typeof body.text === "string" && body.text.length > 0;
+  const hasData = body.data && Object.keys(body.data).length > 0;
+  if (!hasText && !hasData) {
+    throw new BadRequestError("event must carry at least text or data");
+  }
+
+  const now = new Date().toISOString();
+  const dataStr = body.data ? JSON.stringify(body.data) : null;
+
+  const evRes = insertTaskEvent.run(
+    body.task_id,
+    body.from_id,
+    body.intent,
+    body.text ?? null,
+    dataStr,
+    now
+  );
+  const eventId = Number(evRes.lastInsertRowid);
+  const eventRow = selectTaskEventById.get(eventId) as TaskEvent;
+  const participants = selectTaskParticipants.all(body.task_id) as TaskParticipant[];
+
+  await appendTaskEventFile(body.task_id, eventRow, participants);
+
+  const envelope = formatEventEnvelope(eventRow);
+  for (const p of participants) {
+    if (p.peer_id === body.from_id) continue;
+    deliverTaskEventToPeer(p.peer_id, envelope);
+  }
+
+  return { event_id: eventId };
+}
+
 function handlePollMessages(body: PollMessagesRequest): Promise<PollMessagesResponse> {
   const { id, wait_ms, since_id } = body;
 
@@ -601,23 +979,50 @@ function handlePollMessages(body: PollMessagesRequest): Promise<PollMessagesResp
   }
 
   // Gather any immediately-available events. Replay mode (since_id) is
-  // read-only — does NOT mark events delivered. Normal mode consumes the
-  // `delivered=0` queue and marks each row on the way out.
-  const pending = since_id !== undefined
+  // read-only — does NOT mark events delivered; task_events are NOT included
+  // in replay mode (existing slice-2 behavior preserved for messages only).
+  // Normal mode consumes the `delivered=0` queue for messages AND returns
+  // any task_events above the peer's task_event_cursor that they participate
+  // in.
+  const pendingMessages = since_id !== undefined
     ? (selectSinceId.all(id, since_id) as Message[])
     : (selectUndelivered.all(id) as Message[]);
 
-  if (pending.length > 0) {
+  const cursorRow = since_id === undefined
+    ? (selectTaskEventCursor.get(id) as { last_event_id: number } | null)
+    : null;
+  const taskCursor = cursorRow?.last_event_id ?? 0;
+  const pendingTaskEvents = since_id === undefined
+    ? (selectTaskEventsSincePeer.all(id, taskCursor, id) as TaskEvent[])
+    : [];
+
+  const totalCount = pendingMessages.length + pendingTaskEvents.length;
+  if (totalCount > 0) {
     if (since_id === undefined) {
-      for (const m of pending) markDelivered.run(m.id);
+      for (const m of pendingMessages) markDelivered.run(m.id);
     }
+
+    const events: PeerEvent<Message | TaskEvent>[] = [];
+    for (const m of pendingMessages) {
+      events.push({ event_id: m.id, type: "message", payload: m });
+    }
+    for (const te of pendingTaskEvents) {
+      events.push({ event_id: te.id, type: "task_event", payload: te });
+    }
+
+    // Advance task_event_cursor to the max task_event id we just delivered.
+    if (since_id === undefined && pendingTaskEvents.length > 0) {
+      const maxTe = pendingTaskEvents[pendingTaskEvents.length - 1]!.id;
+      upsertTaskEventCursor.run(id, maxTe);
+    }
+
+    const maxEventId = events.reduce(
+      (acc, e) => (e.event_id > acc ? e.event_id : acc),
+      0
+    );
     return Promise.resolve({
-      events: pending.map((m) => ({
-        event_id: m.id,
-        type: "message" as const,
-        payload: m,
-      })),
-      next_cursor: pending[pending.length - 1]!.id,
+      events: events as PeerEvent<Message>[],
+      next_cursor: maxEventId,
     });
   }
 
@@ -715,6 +1120,10 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(await handlePollMessages(body as PollMessagesRequest));
+        case "/dispatch-task":
+          return Response.json(await handleDispatchTask(body as DispatchTaskRequest));
+        case "/send-task-event":
+          return Response.json(await handleSendTaskEvent(body as SendTaskEventRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

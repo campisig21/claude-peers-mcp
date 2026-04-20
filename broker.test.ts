@@ -1212,6 +1212,7 @@ describe("A2A-lite schema (Slice 3)", () => {
         ...process.env,
         CLAUDE_PEERS_PORT: String(TEST_PORT),
         CLAUDE_PEERS_DB: TEST_DB,
+        CLAUDE_PEERS_HOME: TEST_HOME,
       },
       stdio: ["ignore", "ignore", "pipe"],
     });
@@ -2110,6 +2111,7 @@ describe("Long-poll broker restart (T8 — LAST in file)", () => {
         ...process.env,
         CLAUDE_PEERS_PORT: String(TEST_PORT),
         CLAUDE_PEERS_DB: TEST_DB,
+        CLAUDE_PEERS_HOME: TEST_HOME,
       },
       stdio: ["ignore", "ignore", "pipe"],
     });
