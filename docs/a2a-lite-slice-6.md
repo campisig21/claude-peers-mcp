@@ -89,7 +89,21 @@ Implication: the `push` field still ships on each SSE event (it's part of the en
 
 Future ergonomics (filters, richer formatting, JSON output) can land as flags in later slices. Slice 6 ships the plainest useful shape.
 
-### D7. Test strategy — broker-side uses native `fetch` + `ReadableStream.getReader()`; CLI-side spawns subprocess
+### D7. SSE is a read-only tail — no interaction with delivery state
+
+The SSE subscriber is **not** a peer. It does NOT:
+- Install an entry in `pendingWaiters` (the long-poll map).
+- Advance `task_event_cursors.last_event_id` for any peer.
+- Flip `messages.delivered` from 0 to 1.
+- Identify itself by a peer_id (the connection has no identity beyond the HTTP socket).
+
+The subscriber receives a fan-out of events as they are inserted into the DB. Events delivered to the tail are orthogonal to delivery semantics — a peer who is offline and has a backlog of undelivered messages still has those messages flagged `delivered=0` even if the tail already emitted them to the operator.
+
+Operational framing: the tail is a **forensic/observability view** owned by the operator (the human running the broker), not a participant in the coordination model. It is designed to be disposable — reconnecting after drop-out starts from "now" with no gap-filling, consistent with `tail -f` semantics. If the operator wants a gap-free audit record, that's slice-7 replay reading from DB directly.
+
+Implication for fan-out implementation: the broadcast call happens AFTER the DB write AND AFTER the delivery-state mutations (cursor upserts, `delivered` flag flips, waiter resolves). The tail observes the *already-committed* event, not a preview. If a subscriber throws during broadcast, delivery semantics for regular peers are unaffected — per D4's per-subscriber drop-on-error.
+
+### D8. Test strategy — broker-side uses native `fetch` + `ReadableStream.getReader()`; CLI-side spawns subprocess
 
 SSE is a streaming protocol; tests need to start a connection, send events, observe them on the wire, then close. bun's test runner supports `fetch` with body streaming; we read via `getReader()` and assert on decoded chunks.
 
@@ -209,7 +223,7 @@ Spawn tail. Send message A → B. Dispatch task A → [B]. Read stdout. Assert o
 2. **D2 — no `event:` field on SSE frames.** Keeps parser trivial but breaks a browser `EventSource` consumer that filters by event type. Not a slice-6 use case, flagging for awareness.
 3. **D5 — tail sees all events, no shouldPush filter.** Agree tail should be forensic/complete? Alternative: respect push flag (would match MCP server behavior but defeats the purpose of an audit tail).
 4. **Extend `/debug/waiters` to include `sse_subscribers` count vs new `/debug/sse` endpoint.** I lean extend — fewer surfaces.
-5. **D7 — SSE test strategy.** Testing streams without hanging is fragile. Using `getReader().read()` with a per-chunk timeout + explicit close. Alternative: test via the CLI subprocess which does its own read loop. I'm planning both.
+5. **D8 — SSE test strategy.** Testing streams without hanging is fragile. Using `getReader().read()` with a per-chunk timeout + explicit close. Alternative: test via the CLI subprocess which does its own read loop. I'm planning both.
 6. **C1/C2 CLI subprocess tests.** Subprocesses in bun test are fine but can accumulate zombies. Want me to add an afterEach cleanup pattern for spawned tails, or rely on test-local try/finally?
 7. **Fan-out error handling.** Per-subscriber try/catch + drop on error. A pathological subscriber that ENOMEMs mid-write won't break other subscribers. Agree?
 
