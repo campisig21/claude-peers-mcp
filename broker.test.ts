@@ -1,4 +1,5 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
+import { Database } from "bun:sqlite";
 import path from "path";
 import os from "os";
 import fs from "fs";
@@ -1000,6 +1001,190 @@ describe("Long-poll transport (Slice 2)", () => {
 
     await brokerFetch("/unregister", { id: aid });
     await killPeer(pa);
+  });
+});
+
+describe("A2A-lite schema (Slice 3)", () => {
+  // All slice-3 assertions inspect the broker's DB directly via a second
+  // readonly connection. WAL mode allows concurrent readers alongside the
+  // broker's write connection. We do NOT use HTTP endpoints here because
+  // slice 3 intentionally exposes zero new endpoints — the schema exists
+  // purely as a landing pad for slice 4.
+
+  function openRo(): Database {
+    return new Database(TEST_DB, { readonly: true });
+  }
+
+  test("S1: tasks table exists with expected columns", () => {
+    const db = openRo();
+    try {
+      const cols = db.query("PRAGMA table_info(tasks)").all() as Array<{
+        name: string;
+        pk: number;
+        notnull: number;
+        dflt_value: string | null;
+      }>;
+      const byName = Object.fromEntries(cols.map((c) => [c.name, c]));
+      expect(Object.keys(byName).sort()).toEqual(
+        ["context_id", "created_at", "created_by", "id", "state", "title"].sort()
+      );
+      expect(byName.id!.pk).toBe(1);
+      expect(byName.state!.dflt_value).toMatch(/'open'/);
+      expect(byName.created_at!.notnull).toBe(1);
+      expect(byName.created_by!.notnull).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("S2: task_participants table exists with composite PK", () => {
+    const db = openRo();
+    try {
+      const cols = db.query("PRAGMA table_info(task_participants)").all() as Array<{
+        name: string;
+        pk: number;
+      }>;
+      const byName = Object.fromEntries(cols.map((c) => [c.name, c]));
+      expect(Object.keys(byName).sort()).toEqual(
+        ["joined_at", "peer_id", "role_at_join", "task_id"].sort()
+      );
+      expect(byName.task_id!.pk).toBeGreaterThan(0);
+      expect(byName.peer_id!.pk).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("S3: task_events table exists with AUTOINCREMENT id", () => {
+    const db = openRo();
+    try {
+      const cols = db.query("PRAGMA table_info(task_events)").all() as Array<{
+        name: string;
+        pk: number;
+      }>;
+      const byName = Object.fromEntries(cols.map((c) => [c.name, c]));
+      expect(Object.keys(byName).sort()).toEqual(
+        ["data", "from_id", "id", "intent", "sent_at", "task_id", "text"].sort()
+      );
+      expect(byName.id!.pk).toBe(1);
+      const sqlRow = db.query(
+        "SELECT sql FROM sqlite_master WHERE name = 'task_events'"
+      ).get() as { sql: string };
+      expect(sqlRow.sql).toContain("AUTOINCREMENT");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("S4: task_event_cursors table exists with peer_id PK", () => {
+    const db = openRo();
+    try {
+      const cols = db.query("PRAGMA table_info(task_event_cursors)").all() as Array<{
+        name: string;
+        pk: number;
+        notnull: number;
+        dflt_value: string | null;
+      }>;
+      const byName = Object.fromEntries(cols.map((c) => [c.name, c]));
+      expect(Object.keys(byName).sort()).toEqual(["last_event_id", "peer_id"]);
+      expect(byName.peer_id!.pk).toBe(1);
+      expect(byName.last_event_id!.notnull).toBe(1);
+      expect(byName.last_event_id!.dflt_value).toBe("0");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("S5: idx_task_events_task indexes (task_id, id)", () => {
+    const db = openRo();
+    try {
+      const idx = db.query(
+        "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND name = 'idx_task_events_task'"
+      ).get() as { name: string; tbl_name: string } | null;
+      expect(idx).not.toBeNull();
+      expect(idx!.tbl_name).toBe("task_events");
+
+      const info = db.query("PRAGMA index_info(idx_task_events_task)").all() as Array<{
+        seqno: number;
+        name: string;
+      }>;
+      const ordered = [...info].sort((a, b) => a.seqno - b.seqno);
+      expect(ordered.map((r) => r.name)).toEqual(["task_id", "id"]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("S6: audit_stream view exists with the expected column set", () => {
+    const db = openRo();
+    try {
+      const v = db.query(
+        "SELECT type, sql FROM sqlite_master WHERE name = 'audit_stream'"
+      ).get() as { type: string; sql: string } | null;
+      expect(v).not.toBeNull();
+      expect(v!.type).toBe("view");
+
+      // Execute against the view to confirm the column set. LIMIT 0 keeps
+      // this cheap and independent of row content.
+      const stmt = db.query("SELECT * FROM audit_stream LIMIT 0");
+      const cols = stmt.columnNames;
+      expect(cols.sort()).toEqual(
+        ["body", "data", "from_id", "intent", "sent_at", "source", "source_id", "task_id", "to_id"].sort()
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test("S7: audit_stream reflects messages inserted via /send-message", async () => {
+    const a = await registerPeer({ summary: "sender" });
+    const b = await registerPeer({ summary: "recipient" });
+    const sendRes = await brokerFetch<{ ok: boolean }>("/send-message", {
+      from_id: a.id,
+      to_id: b.id,
+      text: "hello slice 3",
+    });
+    expect(sendRes.data.ok).toBe(true);
+
+    const db = openRo();
+    try {
+      const rows = db.query(
+        "SELECT source, from_id, to_id, body, intent, task_id, data FROM audit_stream WHERE from_id = ? AND body = ?"
+      ).all(a.id, "hello slice 3") as Array<{
+        source: string;
+        from_id: string;
+        to_id: string;
+        body: string;
+        intent: string;
+        task_id: string | null;
+        data: string | null;
+      }>;
+      expect(rows.length).toBe(1);
+      expect(rows[0]!.source).toBe("message");
+      expect(rows[0]!.intent).toBe("text");
+      expect(rows[0]!.task_id).toBeNull();
+      expect(rows[0]!.data).toBeNull();
+      expect(rows[0]!.to_id).toBe(b.id);
+    } finally {
+      db.close();
+    }
+
+    await brokerFetch("/unregister", { id: a.id });
+    await brokerFetch("/unregister", { id: b.id });
+    await killPeer(a.proc);
+    await killPeer(b.proc);
+  });
+
+  test("S8: audit_stream has no task_event rows in slice 3", () => {
+    const db = openRo();
+    try {
+      const row = db.query(
+        "SELECT COUNT(*) AS n FROM audit_stream WHERE source = 'task_event'"
+      ).get() as { n: number };
+      expect(row.n).toBe(0);
+    } finally {
+      db.close();
+    }
   });
 });
 
