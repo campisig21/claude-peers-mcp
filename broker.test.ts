@@ -2473,20 +2473,28 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
     reader: ReadableStreamDefaultReader<Uint8Array>;
     cancel: () => Promise<void>;
   }> {
-    const res = await fetch(`${BROKER_URL}/events/stream`);
+    // AbortController is required for server-side disconnect detection. Bun
+    // (as of 1.3.10) does not propagate ReadableStream.cancel() on the
+    // client to request.signal.abort on the server, but AbortController
+    // abort() does. Without this, the broker's subscriber cleanup path
+    // doesn't fire when tests complete and the Set accumulates stragglers.
+    const ctrl = new AbortController();
+    const res = await fetch(`${BROKER_URL}/events/stream`, { signal: ctrl.signal });
     if (!res.ok || !res.body) throw new Error(`SSE handshake failed: ${res.status}`);
     const reader = res.body.getReader();
     return {
       reader,
       cancel: async () => {
+        ctrl.abort();
         try { await reader.cancel(); } catch { /* noop */ }
       },
     };
   }
 
-  // Read from the SSE reader until we collect `count` complete frames or
-  // `timeoutMs` elapses. Each frame ends with `\n\n`. Returns parsed JSON
-  // envelopes.
+  // Read from the SSE reader until we collect `count` complete DATA frames
+  // or `timeoutMs` elapses. Each frame ends with `\n\n`. Comment frames
+  // (lines starting with `:` — e.g. the broker's initial headers-flush
+  // heartbeat) are skipped and do NOT count toward the target.
   async function readFrames(
     reader: ReadableStreamDefaultReader<Uint8Array>,
     count: number,
@@ -2494,9 +2502,9 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
   ): Promise<Array<{ event_id: number; type: string; payload: Record<string, unknown>; push?: boolean }>> {
     const dec = new TextDecoder();
     let buf = "";
-    const frames: string[] = [];
+    const dataFrames: Array<{ event_id: number; type: string; payload: Record<string, unknown>; push?: boolean }> = [];
     const deadline = Date.now() + timeoutMs;
-    while (frames.length < count && Date.now() < deadline) {
+    while (dataFrames.length < count && Date.now() < deadline) {
       const remaining = deadline - Date.now();
       const raceResult = await Promise.race([
         reader.read(),
@@ -2508,16 +2516,17 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
       buf += dec.decode(raceResult.value, { stream: true });
       let idx = buf.indexOf("\n\n");
       while (idx >= 0) {
-        frames.push(buf.slice(0, idx));
+        const frame = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
         idx = buf.indexOf("\n\n");
+        const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+        if (dataLine) {
+          dataFrames.push(JSON.parse(dataLine.slice(5).trim()));
+        }
+        // Lines starting with `:` are SSE comments — silently skipped.
       }
     }
-    return frames.map((frame) => {
-      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
-      if (!dataLine) return { event_id: -1, type: "", payload: {} };
-      return JSON.parse(dataLine.slice(5).trim());
-    });
+    return dataFrames;
   }
 
   async function sseSubscriberCount(): Promise<number> {
@@ -2712,10 +2721,16 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
   });
 
   test("M2: one subscriber disconnecting does not affect remaining", async () => {
+    // Capture baseline BEFORE opening new subs so assertions stay stable
+    // even if a prior test's AbortController cleanup is racing with this
+    // test's setup (abort propagation can take 50-200ms in Bun's server).
+    const baseline = await sseSubscriberCount();
     const sub1 = await openSse();
     const sub2 = await openSse();
     await sub1.cancel();
-    await new Promise((r) => setTimeout(r, 100));
+    // Wait longer than the test's cleanup-race budget so sub1's server-
+    // side abort has fired and the set is down to baseline + 1 (sub2).
+    await new Promise((r) => setTimeout(r, 300));
     try {
       const a = await registerPeer({ summary: "A" });
       const b = await registerPeer({ summary: "B" });
@@ -2724,7 +2739,7 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
       expect(frames.length).toBe(1);
       expect((frames[0]!.payload as { text: string }).text).toBe("remaining sub");
       const count = await sseSubscriberCount();
-      expect(count).toBe(1);
+      expect(count).toBe(baseline + 1);
       for (const p of [a, b]) {
         await brokerFetch("/unregister", { id: p.id });
         await killPeer(p.proc);
@@ -2746,11 +2761,13 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
     expect(await sseSubscriberCount()).toBe(baseline);
   });
 
-  test("D2: abrupt body.cancel without reading cleans up subscriber", async () => {
+  test("D2: abrupt AbortController.abort without reading cleans up subscriber", async () => {
     const baseline = await sseSubscriberCount();
-    const res = await fetch(`${BROKER_URL}/events/stream`);
-    await res.body!.cancel();
-    await new Promise((r) => setTimeout(r, 100));
+    const ctrl = new AbortController();
+    const res = await fetch(`${BROKER_URL}/events/stream`, { signal: ctrl.signal });
+    expect(res.ok).toBe(true);
+    ctrl.abort();
+    await new Promise((r) => setTimeout(r, 200));
     expect(await sseSubscriberCount()).toBe(baseline);
   });
 
