@@ -2461,6 +2461,358 @@ describe("A2A-lite push policy (Slice 5)", () => {
   });
 });
 
+describe("A2A-lite SSE tail (Slice 6)", () => {
+  // Tests exercise GET /events/stream. Each opens an HTTP stream, reads
+  // one or two SSE frames, then cancels cleanly. Failure to cancel a
+  // stream leaks a subscriber into the broker's set and can affect
+  // subsequent tests' counts.
+
+  const CLI_SCRIPT = path.join(import.meta.dir, "cli.ts");
+
+  async function openSse(): Promise<{
+    reader: ReadableStreamDefaultReader<Uint8Array>;
+    cancel: () => Promise<void>;
+  }> {
+    const res = await fetch(`${BROKER_URL}/events/stream`);
+    if (!res.ok || !res.body) throw new Error(`SSE handshake failed: ${res.status}`);
+    const reader = res.body.getReader();
+    return {
+      reader,
+      cancel: async () => {
+        try { await reader.cancel(); } catch { /* noop */ }
+      },
+    };
+  }
+
+  // Read from the SSE reader until we collect `count` complete frames or
+  // `timeoutMs` elapses. Each frame ends with `\n\n`. Returns parsed JSON
+  // envelopes.
+  async function readFrames(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    count: number,
+    timeoutMs = 2000
+  ): Promise<Array<{ event_id: number; type: string; payload: Record<string, unknown>; push?: boolean }>> {
+    const dec = new TextDecoder();
+    let buf = "";
+    const frames: string[] = [];
+    const deadline = Date.now() + timeoutMs;
+    while (frames.length < count && Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      const raceResult = await Promise.race([
+        reader.read(),
+        new Promise<{ done: true; value: undefined }>((r) =>
+          setTimeout(() => r({ done: true, value: undefined }), remaining)
+        ),
+      ]);
+      if (raceResult.done) break;
+      buf += dec.decode(raceResult.value, { stream: true });
+      let idx = buf.indexOf("\n\n");
+      while (idx >= 0) {
+        frames.push(buf.slice(0, idx));
+        buf = buf.slice(idx + 2);
+        idx = buf.indexOf("\n\n");
+      }
+    }
+    return frames.map((frame) => {
+      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!dataLine) return { event_id: -1, type: "", payload: {} };
+      return JSON.parse(dataLine.slice(5).trim());
+    });
+  }
+
+  async function sseSubscriberCount(): Promise<number> {
+    const { data } = await brokerFetch<{ sse_subscribers?: number }>("/debug/waiters");
+    return data.sse_subscribers ?? 0;
+  }
+
+  // ---- H: Handshake ----
+
+  test("H1: GET /events/stream returns 200 with text/event-stream content type", async () => {
+    const res = await fetch(`${BROKER_URL}/events/stream`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    await res.body?.cancel();
+  });
+
+  test("H2: /debug/waiters exposes sse_subscribers count", async () => {
+    const before = await sseSubscriberCount();
+    const { cancel } = await openSse();
+    await new Promise((r) => setTimeout(r, 100));
+    const during = await sseSubscriberCount();
+    expect(during).toBe(before + 1);
+    await cancel();
+    await new Promise((r) => setTimeout(r, 100));
+    const after = await sseSubscriberCount();
+    expect(after).toBe(before);
+  });
+
+  // ---- F: Fan-out ----
+
+  test("F1: /send-message fans out to SSE subscriber", async () => {
+    const { reader, cancel } = await openSse();
+    try {
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "sse test" });
+      const frames = await readFrames(reader, 1);
+      expect(frames.length).toBeGreaterThanOrEqual(1);
+      expect(frames[0]!.type).toBe("message");
+      expect((frames[0]!.payload as { text: string }).text).toBe("sse test");
+      for (const p of [a, b]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      await cancel();
+    }
+  });
+
+  test("F2: /dispatch-task fans out to SSE subscriber", async () => {
+    const { reader, cancel } = await openSse();
+    try {
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      await brokerFetch("/dispatch-task", {
+        from_id: a.id,
+        title: "sse dispatch",
+        participants: [b.id],
+      });
+      const frames = await readFrames(reader, 1);
+      const te = frames.find((f) => f.type === "task_event");
+      expect(te).toBeDefined();
+      expect((te!.payload as { intent: string }).intent).toBe("dispatch");
+      for (const p of [a, b]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      await cancel();
+    }
+  });
+
+  test("F3: /send-task-event fans out to SSE subscriber", async () => {
+    const { reader, cancel } = await openSse();
+    try {
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      const disp = await brokerFetch<{ task_id: string }>("/dispatch-task", {
+        from_id: a.id,
+        title: "sse ev",
+        participants: [b.id],
+      });
+      const tid = disp.data.task_id;
+      await brokerFetch("/send-task-event", {
+        from_id: b.id,
+        task_id: tid,
+        intent: "state_change",
+        data: { to: "done" },
+      });
+      const frames = await readFrames(reader, 2);
+      const sc = frames.find((f) =>
+        f.type === "task_event" &&
+        (f.payload as { intent: string }).intent === "state_change"
+      );
+      expect(sc).toBeDefined();
+      for (const p of [a, b]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      await cancel();
+    }
+  });
+
+  test("F4: SSE tail sees suppressed events (push flag included, not filtered)", async () => {
+    const { reader, cancel } = await openSse();
+    try {
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      const c = await registerPeer({ summary: "C" });
+      await brokerFetch("/dispatch-task", {
+        from_id: a.id,
+        title: "observer test",
+        participants: [b.id],
+        observers: [c.id],
+      });
+      const frames = await readFrames(reader, 1);
+      const te = frames.find((f) => f.type === "task_event");
+      expect(te).toBeDefined();
+      // The frame envelope always carries push. Value depends on receiver;
+      // the tail is broadcast and doesn't apply shouldPush — the emitted
+      // `push` reflects the sender-side default of the ENVELOPE, not any
+      // specific receiver. For broadcast we set push=true on the envelope
+      // so tail consumers see the un-suppressed default.
+      expect(te!.push).toBe(true);
+      for (const p of [a, b, c]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      await cancel();
+    }
+  });
+
+  // ---- M: Multi-subscriber ----
+
+  test("M1: two subscribers both receive the same event", async () => {
+    const sub1 = await openSse();
+    const sub2 = await openSse();
+    try {
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "two subs" });
+      const [f1, f2] = await Promise.all([
+        readFrames(sub1.reader, 1),
+        readFrames(sub2.reader, 1),
+      ]);
+      expect((f1[0]!.payload as { text: string }).text).toBe("two subs");
+      expect((f2[0]!.payload as { text: string }).text).toBe("two subs");
+      for (const p of [a, b]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      await sub1.cancel();
+      await sub2.cancel();
+    }
+  });
+
+  test("M2: one subscriber disconnecting does not affect remaining", async () => {
+    const sub1 = await openSse();
+    const sub2 = await openSse();
+    await sub1.cancel();
+    await new Promise((r) => setTimeout(r, 100));
+    try {
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "remaining sub" });
+      const frames = await readFrames(sub2.reader, 1);
+      expect(frames.length).toBe(1);
+      expect((frames[0]!.payload as { text: string }).text).toBe("remaining sub");
+      const count = await sseSubscriberCount();
+      expect(count).toBe(1);
+      for (const p of [a, b]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      await sub2.cancel();
+    }
+  });
+
+  // ---- D: Disconnect cleanup ----
+
+  test("D1: subscriber count drops to baseline after cancel", async () => {
+    const baseline = await sseSubscriberCount();
+    const { cancel } = await openSse();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(await sseSubscriberCount()).toBe(baseline + 1);
+    await cancel();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(await sseSubscriberCount()).toBe(baseline);
+  });
+
+  test("D2: abrupt body.cancel without reading cleans up subscriber", async () => {
+    const baseline = await sseSubscriberCount();
+    const res = await fetch(`${BROKER_URL}/events/stream`);
+    await res.body!.cancel();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(await sseSubscriberCount()).toBe(baseline);
+  });
+
+  // ---- C: CLI integration ----
+
+  test("C1: bun cli.ts tail subprocess prints incoming message event", async () => {
+    const tailProc = Bun.spawn(["bun", CLI_SCRIPT, "tail"], {
+      env: { ...process.env, CLAUDE_PEERS_PORT: String(TEST_PORT) },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    try {
+      // Wait for tail to establish the SSE connection
+      await new Promise((r) => setTimeout(r, 500));
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "hello tail" });
+
+      // Read tail's stdout until we see the expected line OR 2s elapses
+      const reader = (tailProc.stdout as ReadableStream<Uint8Array>).getReader();
+      const dec = new TextDecoder();
+      let accumulated = "";
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline && !accumulated.includes("hello tail")) {
+        const remaining = deadline - Date.now();
+        const step = await Promise.race([
+          reader.read(),
+          new Promise<{ done: true; value: undefined }>((r) =>
+            setTimeout(() => r({ done: true, value: undefined }), remaining)
+          ),
+        ]);
+        if (step.done) break;
+        if (step.value) accumulated += dec.decode(step.value, { stream: true });
+      }
+      expect(accumulated).toContain("hello tail");
+      expect(accumulated).toContain("[message]");
+      try { reader.releaseLock(); } catch { /* noop */ }
+
+      for (const p of [a, b]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      tailProc.kill();
+      await tailProc.exited;
+    }
+  }, 10_000);
+
+  test("C2: bun cli.ts tail prints both message and task_event lines", async () => {
+    const tailProc = Bun.spawn(["bun", CLI_SCRIPT, "tail"], {
+      env: { ...process.env, CLAUDE_PEERS_PORT: String(TEST_PORT) },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "both test" });
+      await brokerFetch("/dispatch-task", {
+        from_id: a.id,
+        title: "tail task",
+        participants: [b.id],
+      });
+
+      const reader = (tailProc.stdout as ReadableStream<Uint8Array>).getReader();
+      const dec = new TextDecoder();
+      let accumulated = "";
+      const deadline = Date.now() + 3000;
+      while (
+        Date.now() < deadline &&
+        (!accumulated.includes("[message]") || !accumulated.includes("[task_event]"))
+      ) {
+        const remaining = deadline - Date.now();
+        const step = await Promise.race([
+          reader.read(),
+          new Promise<{ done: true; value: undefined }>((r) =>
+            setTimeout(() => r({ done: true, value: undefined }), remaining)
+          ),
+        ]);
+        if (step.done) break;
+        if (step.value) accumulated += dec.decode(step.value, { stream: true });
+      }
+      expect(accumulated).toContain("[message]");
+      expect(accumulated).toContain("[task_event]");
+      try { reader.releaseLock(); } catch { /* noop */ }
+
+      for (const p of [a, b]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      tailProc.kill();
+      await tailProc.exited;
+    }
+  }, 10_000);
+});
+
 // T8 lives in its own describe at the END of the file because it
 // restarts the broker subprocess. afterAll's brokerProc.kill() hits
 // the replacement broker that T8 spawns (reassigned to the module-scoped
