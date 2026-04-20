@@ -2083,6 +2083,370 @@ describe("A2A-lite typed tools (Slice 4)", () => {
   });
 });
 
+describe("A2A-lite push policy (Slice 5)", () => {
+  // Slice 5 broadens the Event envelope with a `push` flag. Tests hit the
+  // broker's /poll-messages endpoint directly and read push from the
+  // returned events. Tests fail in baseline because:
+  //   - `push` field is absent on slice-4 events (undefined, not true/false)
+  //   - `observers` field on /dispatch-task is not yet accepted by broker
+
+  interface PushDispatchResp {
+    task_id: string;
+    participants: string[];
+    event_id: number;
+  }
+
+  async function dispatchS5(
+    fromId: string,
+    participants: string[],
+    opts: {
+      title?: string;
+      observers?: string[];
+      text?: string;
+      data?: Record<string, unknown>;
+    } = {}
+  ): Promise<{ status: number; data: PushDispatchResp | { error: string } }> {
+    return brokerFetch<PushDispatchResp | { error: string }>("/dispatch-task", {
+      from_id: fromId,
+      title: opts.title ?? "slice-5 task",
+      participants,
+      observers: opts.observers,
+      text: opts.text,
+      data: opts.data,
+    });
+  }
+
+  async function sendEvt(
+    fromId: string,
+    taskId: string,
+    intent: string,
+    opts: { text?: string; data?: Record<string, unknown> } = {}
+  ) {
+    return brokerFetch<{ event_id?: number; error?: string }>("/send-task-event", {
+      from_id: fromId,
+      task_id: taskId,
+      intent,
+      text: opts.text,
+      data: opts.data,
+    });
+  }
+
+  interface PushPollEvent {
+    event_id: number;
+    type: "message" | "task_event";
+    payload: { intent?: string; task_id?: string; text?: string };
+    push?: boolean;
+  }
+
+  async function pollTaskEvents(peerId: string): Promise<PushPollEvent[]> {
+    const { data } = await brokerFetch<{ events: PushPollEvent[] }>("/poll-messages", {
+      id: peerId,
+      wait_ms: 0,
+    });
+    return data.events.filter((e) => e.type === "task_event");
+  }
+
+  // ---- R: Rule-based push expectations ----
+
+  test("R1: observer receives event with push=false; non-observer gets push=true", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = await dispatchS5(a.id, [b.id], { observers: [c.id] });
+    expect(disp.status).toBe(200);
+    const resp = disp.data as PushDispatchResp;
+    await sendEvt(a.id, resp.task_id, "state_change", { data: { to: "done" } });
+
+    // Drain dispatch event first for C and B to isolate the state_change
+    await pollTaskEvents(b.id);
+    await pollTaskEvents(c.id);
+    await sendEvt(a.id, resp.task_id, "state_change", { data: { to: "done" } });
+
+    const bEvents = await pollTaskEvents(b.id);
+    const cEvents = await pollTaskEvents(c.id);
+    expect(bEvents.some((e) => e.push === true)).toBe(true);
+    expect(cEvents.every((e) => e.push === false)).toBe(true);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R2: sender never receives delivery (slice-4 regression)", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await dispatchS5(a.id, [b.id]);
+
+    const aEvents = await pollTaskEvents(a.id);
+    expect(aEvents.length).toBe(0);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R3: state_change→working suppressed universally", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id, c.id])).data as PushDispatchResp;
+    // Drain dispatch events so subsequent poll returns only the new event
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(b.id);
+    await pollTaskEvents(c.id);
+    await sendEvt(b.id, disp.task_id, "state_change", { data: { to: "working" } });
+
+    for (const recipient of [a, c]) {
+      const events = await pollTaskEvents(recipient.id);
+      const sc = events.find((e) => e.payload.intent === "state_change");
+      expect(sc).toBeDefined();
+      expect(sc!.push).toBe(false);
+    }
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R4: state_change→done is NOT suppressed", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id, c.id])).data as PushDispatchResp;
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(b.id);
+    await pollTaskEvents(c.id);
+    await sendEvt(b.id, disp.task_id, "state_change", { data: { to: "done" } });
+
+    for (const recipient of [a, c]) {
+      const events = await pollTaskEvents(recipient.id);
+      const sc = events.find((e) => e.payload.intent === "state_change");
+      expect(sc).toBeDefined();
+      expect(sc!.push).toBe(true);
+    }
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R5: targeted question — only named target receives push", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id, c.id])).data as PushDispatchResp;
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(c.id);
+    await sendEvt(b.id, disp.task_id, "question", { text: "for A", data: { to: a.id } });
+
+    const aEvents = await pollTaskEvents(a.id);
+    const cEvents = await pollTaskEvents(c.id);
+    const aQ = aEvents.find((e) => e.payload.intent === "question");
+    const cQ = cEvents.find((e) => e.payload.intent === "question");
+    expect(aQ?.push).toBe(true);
+    expect(cQ?.push).toBe(false);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R6: untargeted question — push to all non-senders", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id, c.id])).data as PushDispatchResp;
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(c.id);
+    await sendEvt(b.id, disp.task_id, "question", { text: "anyone?" });
+
+    for (const recipient of [a, c]) {
+      const events = await pollTaskEvents(recipient.id);
+      const q = events.find((e) => e.payload.intent === "question");
+      expect(q?.push).toBe(true);
+    }
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R7: targeted answer — only original asker receives push", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id, c.id])).data as PushDispatchResp;
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(b.id);
+    await pollTaskEvents(c.id);
+    await sendEvt(a.id, disp.task_id, "answer", { text: "reply", data: { reply_to_from: b.id } });
+
+    const bEvents = await pollTaskEvents(b.id);
+    const cEvents = await pollTaskEvents(c.id);
+    expect(bEvents.find((e) => e.payload.intent === "answer")?.push).toBe(true);
+    expect(cEvents.find((e) => e.payload.intent === "answer")?.push).toBe(false);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R8: complete intent pushes to all non-senders", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id, c.id])).data as PushDispatchResp;
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(b.id);
+    await sendEvt(c.id, disp.task_id, "complete", { text: "done" });
+
+    for (const recipient of [a, b]) {
+      const events = await pollTaskEvents(recipient.id);
+      const c = events.find((e) => e.payload.intent === "complete");
+      expect(c?.push).toBe(true);
+    }
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R9: cancel intent pushes to all non-senders", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id, c.id])).data as PushDispatchResp;
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(b.id);
+    await sendEvt(c.id, disp.task_id, "cancel", { text: "abort" });
+
+    for (const recipient of [a, b]) {
+      const events = await pollTaskEvents(recipient.id);
+      const cx = events.find((e) => e.payload.intent === "cancel");
+      expect(cx?.push).toBe(true);
+    }
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("R10: observer rule wins over targeted question", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchS5(a.id, [b.id], { observers: [c.id] })).data as PushDispatchResp;
+    await pollTaskEvents(a.id);
+    await pollTaskEvents(c.id);
+    // B asks a question TARGETED AT C. Observer rule must still suppress
+    // C's push — observer is first in the filter chain.
+    await sendEvt(b.id, disp.task_id, "question", { text: "for C", data: { to: c.id } });
+
+    const cEvents = await pollTaskEvents(c.id);
+    const q = cEvents.find((e) => e.payload.intent === "question");
+    expect(q?.push).toBe(false);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  // ---- I: Integration — Appendix A worked example ----
+
+  test("I1: Appendix A full cycle yields 9 total pushes (A=4, B=3, C=2)", async () => {
+    // A=coordinator, B=impl, C=reviewer. Parent spec Appendix A.
+    const a = await registerPeer({ summary: "coordinator" });
+    const b = await registerPeer({ summary: "impl-backend-A" });
+    const c = await registerPeer({ summary: "reviewer-backend-A" });
+
+    const disp = (await dispatchS5(a.id, [b.id, c.id], { text: "dispatch" })).data as PushDispatchResp;
+    const tid = disp.task_id;
+
+    // 8 follow-on events (slice-5 interpretation of Appendix A):
+    //   2: B state_change→working
+    //   3: B question (to: A)
+    //   4: A answer (reply_to_from: B)
+    //   5: B state_change→done
+    //   6: C state_change→working
+    //   7: C state_change→done
+    //   8: C complete
+    await sendEvt(b.id, tid, "state_change", { data: { to: "working" } });
+    await sendEvt(b.id, tid, "question", { text: "nullable?", data: { to: a.id } });
+    await sendEvt(a.id, tid, "answer", { text: "yes nullable", data: { reply_to_from: b.id } });
+    await sendEvt(b.id, tid, "state_change", { data: { to: "done" } });
+    await sendEvt(c.id, tid, "state_change", { data: { to: "working" } });
+    await sendEvt(c.id, tid, "state_change", { data: { to: "done" } });
+    await sendEvt(c.id, tid, "complete", { text: "approved" });
+
+    const counts = { a: 0, b: 0, c: 0 };
+    for (const [label, peer] of [["a", a], ["b", b], ["c", c]] as const) {
+      const events = await pollTaskEvents(peer.id);
+      for (const e of events) if (e.push === true) counts[label]++;
+    }
+
+    // Expected per Appendix A: A=4 pushes, B=3, C=2 → total 9.
+    expect(counts.a).toBe(4);
+    expect(counts.b).toBe(3);
+    expect(counts.c).toBe(2);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  // ---- M: Message event regression ----
+
+  test("M1: message events in poll batch have push=true explicitly", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "hello" });
+    const { data } = await brokerFetch<{ events: PushPollEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 0,
+    });
+    const msg = data.events.find((e) => e.type === "message");
+    expect(msg).toBeDefined();
+    expect(msg!.push).toBe(true);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("M2: mixed batch — message push=true, observer task_event push=false", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "hello" });
+    await dispatchS5(a.id, [], { observers: [b.id] });
+
+    const { data } = await brokerFetch<{ events: PushPollEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 0,
+    });
+    const msg = data.events.find((e) => e.type === "message");
+    const te = data.events.find((e) => e.type === "task_event");
+    expect(msg?.push).toBe(true);
+    expect(te?.push).toBe(false);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+});
+
 // T8 lives in its own describe at the END of the file because it
 // restarts the broker subprocess. afterAll's brokerProc.kill() hits
 // the replacement broker that T8 spawns (reassigned to the module-scoped
