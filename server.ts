@@ -361,6 +361,44 @@ const TOOLS = [
       required: ["role"],
     },
   },
+  {
+    name: "dispatch_task",
+    description:
+      "Create a typed task and dispatch to participants. participants accepts peer IDs or role names (live binding at dispatch time). Returns task_id.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        title: { type: "string" as const },
+        participants: {
+          type: "array" as const,
+          items: { type: "string" as const },
+          description: "Peer IDs or role names (live, resolved at dispatch).",
+        },
+        context_id: { type: "string" as const },
+        text: { type: "string" as const },
+        data: { type: "object" as const },
+      },
+      required: ["title", "participants"],
+    },
+  },
+  {
+    name: "send_task_event",
+    description:
+      "Emit a non-dispatch event on an existing task. intent: state_change|question|answer|complete|cancel.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        task_id: { type: "string" as const },
+        intent: {
+          type: "string" as const,
+          enum: ["state_change", "question", "answer", "complete", "cancel"],
+        },
+        text: { type: "string" as const },
+        data: { type: "object" as const },
+      },
+      required: ["task_id", "intent"],
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -638,6 +676,104 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "dispatch_task": {
+      const rawArgs = args as Record<string, unknown>;
+      const title = rawArgs?.title;
+      const participants = rawArgs?.participants;
+      if (typeof title !== "string" || title.trim() === "") {
+        return {
+          content: [{ type: "text" as const, text: "Invalid title. Must be a non-empty string." }],
+          isError: true,
+        };
+      }
+      if (!Array.isArray(participants) || participants.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "Invalid participants. Must be a non-empty array of peer IDs or role names." }],
+          isError: true,
+        };
+      }
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{
+          task_id: string;
+          participants: string[];
+          event_id: number;
+        }>("/dispatch-task", {
+          from_id: myId,
+          title,
+          participants,
+          context_id: rawArgs?.context_id,
+          text: rawArgs?.text,
+          data: rawArgs?.data,
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Dispatched ${result.task_id} to ${result.participants.length} participant(s): ${result.participants.join(", ")}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text" as const, text: `Failed to dispatch: ${e instanceof Error ? e.message : String(e)}` },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "send_task_event": {
+      const rawArgs = args as Record<string, unknown>;
+      const task_id = rawArgs?.task_id;
+      const intent = rawArgs?.intent;
+      if (typeof task_id !== "string" || task_id.trim() === "") {
+        return {
+          content: [{ type: "text" as const, text: "Invalid task_id." }],
+          isError: true,
+        };
+      }
+      if (typeof intent !== "string") {
+        return {
+          content: [{ type: "text" as const, text: "Invalid intent." }],
+          isError: true,
+        };
+      }
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ event_id: number }>("/send-task-event", {
+          from_id: myId,
+          task_id,
+          intent,
+          text: rawArgs?.text,
+          data: rawArgs?.data,
+        });
+        return {
+          content: [
+            { type: "text" as const, text: `Event ${result.event_id} sent on ${task_id}` },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text" as const, text: `Failed to send task event: ${e instanceof Error ? e.message : String(e)}` },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -666,44 +802,73 @@ async function pollAndPushMessages() {
     );
 
     for (const event of result.events) {
-      // Slice 2 only emits type: "message". Slice 4 will expand to
-      // task_event; guard here so unknown types are safely ignored.
-      if (event.type !== "message") continue;
-      const msg: Message = event.payload;
+      if (event.type === "message") {
+        const msg: Message = event.payload as Message;
 
-      // Look up the sender's info for channel envelope meta
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
+        // Look up the sender's info for channel envelope meta
+        let fromSummary = "";
+        let fromCwd = "";
+        try {
+          const peers = await brokerFetch<Peer[]>("/list-peers", {
+            scope: "machine",
+            cwd: myCwd,
+            git_root: myGitRoot,
+          });
+          const sender = peers.find((p) => p.id === msg.from_id);
+          if (sender) {
+            fromSummary = sender.summary;
+            fromCwd = sender.cwd;
+          }
+        } catch {
+          // Non-critical, proceed without sender info
         }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+        log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      } else if (event.type === "task_event") {
+        // Slice 4: typed event notification. Thin envelope per D8 — no
+        // from_summary/from_cwd. Receiver can Read the task file or call
+        // list_peers if they want more context.
+        const te = event.payload as {
+          id: number;
+          task_id: string;
+          intent: string;
+          from_id: string;
+          text: string | null;
+          data: string | null;
+          sent_at: string;
+        };
+        const preview = te.text ? te.text.slice(0, 80) : "";
+        const content = `[task ${te.task_id}] ${te.intent} from ${te.from_id}${preview ? ": " + preview : ""}`;
+
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content,
+            meta: {
+              from_id: te.from_id,
+              task_id: te.task_id,
+              intent: te.intent,
+              sent_at: te.sent_at,
+            },
+          },
+        });
+
+        log(`Pushed task_event ${te.id} (${te.intent}) on ${te.task_id}`);
+      }
+      // Unknown types silently ignored (forward-compat).
     }
   } catch (e) {
     // Broker might be down temporarily — brokerFetch's self-heal already
