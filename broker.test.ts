@@ -361,12 +361,12 @@ describe("Messaging", () => {
     });
     expect(sendResult.ok).toBe(true);
 
-    const { data: poll } = await brokerFetch<{ messages: { from_id: string; text: string }[] }>(
+    const { data: poll } = await brokerFetch<LongPollResponse>(
       "/poll-messages",
-      { id: recvId }
+      { id: recvId, wait_ms: 0 }
     );
-    expect(poll.messages.length).toBeGreaterThan(0);
-    const found = poll.messages.find((m) => m.text === msgText);
+    expect(poll.events.length).toBeGreaterThan(0);
+    const found = poll.events.map((e) => e.payload).find((m) => m.text === msgText);
     expect(found).toBeDefined();
     expect(found?.from_id).toBe(senderId);
 
@@ -387,16 +387,18 @@ describe("Messaging", () => {
     });
 
     // First poll — should receive the message
-    const { data: firstPoll } = await brokerFetch<{ messages: unknown[] }>("/poll-messages", {
+    const { data: firstPoll } = await brokerFetch<LongPollResponse>("/poll-messages", {
       id: recvId,
+      wait_ms: 0,
     });
-    expect(firstPoll.messages.length).toBeGreaterThan(0);
+    expect(firstPoll.events.length).toBeGreaterThan(0);
 
     // Second poll — should be empty (message already delivered)
-    const { data: secondPoll } = await brokerFetch<{ messages: unknown[] }>("/poll-messages", {
+    const { data: secondPoll } = await brokerFetch<LongPollResponse>("/poll-messages", {
       id: recvId,
+      wait_ms: 0,
     });
-    expect(secondPoll.messages.length).toBe(0);
+    expect(secondPoll.events.length).toBe(0);
 
     await brokerFetch("/unregister", { id: senderId });
     await brokerFetch("/unregister", { id: recvId });
@@ -550,10 +552,11 @@ describe("Unregister", () => {
     const { id: newRecvId, proc: procNewRecv } = await registerPeer();
 
     // The new peer should not have any messages
-    const { data: poll } = await brokerFetch<{ messages: unknown[] }>("/poll-messages", {
+    const { data: poll } = await brokerFetch<LongPollResponse>("/poll-messages", {
       id: newRecvId,
+      wait_ms: 0,
     });
-    expect(poll.messages.length).toBe(0);
+    expect(poll.events.length).toBe(0);
 
     await brokerFetch("/unregister", { id: senderId });
     await brokerFetch("/unregister", { id: newRecvId });
@@ -592,10 +595,10 @@ describe("CLI send-by-role", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain(id);
 
-    const { data: poll } = await brokerFetch<{ messages: { text: string; from_id: string }[] }>(
-      "/poll-messages", { id }
+    const { data: poll } = await brokerFetch<LongPollResponse>(
+      "/poll-messages", { id, wait_ms: 0 }
     );
-    const found = poll.messages.find((m) => m.text === "hello via exact match");
+    const found = poll.events.map((e) => e.payload).find((m) => m.text === "hello via exact match");
     expect(found).toBeDefined();
     expect(found?.from_id).toBe("cli");
 
@@ -653,10 +656,10 @@ describe("CLI send-by-role", () => {
     );
     expect(exitCode).toBe(0);
 
-    const { data: poll } = await brokerFetch<{ messages: { text: string; from_id: string }[] }>(
-      "/poll-messages", { id }
+    const { data: poll } = await brokerFetch<LongPollResponse>(
+      "/poll-messages", { id, wait_ms: 0 }
     );
-    const found = poll.messages.find((m) => m.text === "hook-attributed message");
+    const found = poll.events.map((e) => e.payload).find((m) => m.text === "hook-attributed message");
     expect(found?.from_id).toBe("git-hook:post-merge");
 
     await brokerFetch("/unregister", { id });
