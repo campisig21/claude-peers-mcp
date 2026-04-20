@@ -10,7 +10,11 @@
 
 **Parent spec:** [`docs/a2a-lite.md`](./a2a-lite.md) §"Slice 2: Long-poll transport" + §"Event envelope (transport-agnostic)".
 
-**Revision history:** rev 2 incorporates reviewer yb6oeqry's pre-review feedback: T8 rescoped to broker-subprocess lifecycle only; `/debug/waiters` endpoint added (unconditional, localhost-only); MAX_WAIT_MS excess now fails loud with HTTP 400; cleanup ordering closes the 30 s latency window on SIGTERM; `installedAt` wired into debug output as `age_ms`; invariant comment required at resolver hook; T6 timing hint uses `Promise.all` for determinism; added Task 2.5 checkpoint for reviewer pre-review of failing tests before implementation begins.
+**Revision history:**
+
+- **rev 2** — incorporates reviewer yb6oeqry's pre-impl feedback: T8 rescoped to broker-subprocess lifecycle only; `/debug/waiters` endpoint added (unconditional, localhost-only); MAX_WAIT_MS excess now fails loud with HTTP 400; cleanup ordering closes the 30 s latency window on SIGTERM; `installedAt` wired into debug output as `age_ms`; invariant comment required at resolver hook; T6 timing hint uses `Promise.all` for determinism; added Task 2.5 checkpoint for reviewer pre-review of failing tests before implementation begins.
+
+- **rev 3** — incorporates post-impl review of PR #2. §6 rules 6-7 amended to document the implementation's no-cancel semantics for replay (since_id) and fast-path (wait_ms=0) calls — earlier wording prescribed "same replacement rule applies" but the as-built behavior is deliberately non-replacement for correctness reasons (replay is diagnostic, fast-path is a point-in-time query; neither should side-effect an unrelated subscription). Code was unchanged; spec wording was. See the trailing note in §6 for rationale.
 
 ---
 
@@ -163,9 +167,11 @@ These race scenarios are the reviewer's primary pre-review target. Each has a na
 
 5. **Peer unregister with active waiter** — `/unregister` finds the waiter, cancels it, marks peer dead. MCP server's cleanup path already calls `/unregister` on SIGTERM (server.ts:755-773); new behavior is just "also tear down any open waiter."
 
-6. **since_id replay during active waiter** — peer calls `/poll-messages` with `since_id=N` while a prior waiter for the same peer is still active. Same rule as scenario 1: first waiter cancelled, second installed with replay semantics.
+6. **since_id replay during active waiter** — peer calls `/poll-messages` with `since_id=N` while a prior waiter for the same peer is still active. **Replay does NOT cancel the active waiter.** The replay response is read-only and returns without touching the waiter map; the original long-poll continues to block until a real event arrives or its timeout fires. Rationale: replay is a diagnostic/resync operation, not a new subscription; cancelling the active subscription as a side effect of a replay would surprise correct callers. Waiter replacement applies only when the same peer initiates a NEW long-polling subscription (rule 1).
 
-7. **wait_ms=0 fast path alongside active waiter** — `check_messages` tool fires `/poll-messages` with `wait_ms=0` while the background poll loop has a long-poll waiter installed. Same replacement rule applies: the 0-wait call replaces the waiter, returns immediately; next background poll reinstalls.
+7. **wait_ms=0 fast path alongside active waiter** — `check_messages` tool fires `/poll-messages` with `wait_ms=0` while the background poll loop has a long-poll waiter installed. **Fast-path does NOT cancel the active waiter.** The fast-path call returns immediately with whatever is queued (possibly empty) without touching the waiter map. Rationale: the fast-path call is a point-in-time query, semantically a different operation from subscribing. Cancelling the long-poll every time a user runs `check_messages` would cause needless reconnect churn for no correctness benefit. Under normal operation the long-poll waiter just keeps running underneath.
+
+> **Note on rules 6-7 vs. earlier spec revisions:** rev 1 prescribed "same replacement rule applies" here. Rev 3 aligns the spec with the post-impl reality: replay and fast-path are deliberately *not* replacement-triggers. A post-impl codex pass flagged this as a deviation; review concluded the code's no-cancel semantics are correct and strictly more efficient than cancel-and-reinstall, so the spec was updated rather than the code.
 
 ## Test Plan (reviewer pre-review target)
 
