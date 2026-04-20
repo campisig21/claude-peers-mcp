@@ -10,6 +10,8 @@
 
 **Parent spec:** [`docs/a2a-lite.md`](./a2a-lite.md) §"Slice 2: Long-poll transport" + §"Event envelope (transport-agnostic)".
 
+**Revision history:** rev 2 incorporates reviewer yb6oeqry's pre-review feedback: T8 rescoped to broker-subprocess lifecycle only; `/debug/waiters` endpoint added (unconditional, localhost-only); MAX_WAIT_MS excess now fails loud with HTTP 400; cleanup ordering closes the 30 s latency window on SIGTERM; `installedAt` wired into debug output as `age_ms`; invariant comment required at resolver hook; T6 timing hint uses `Promise.all` for determinism; added Task 2.5 checkpoint for reviewer pre-review of failing tests before implementation begins.
+
 ---
 
 ## Table of Contents
@@ -218,12 +220,14 @@ All tests go in `broker.test.ts`. Each scenario gets a named `test(...)` block. 
 
 ### T6 — Concurrent sends to same peer deliver both (one via waiter, one via DB)
 
-**Scenario:** Peer A is long-polling with `wait_ms=5000`. Two `/send-message` calls fire at the broker within ~5 ms of each other, both targeting A.
+**Scenario:** Peer A is long-polling with `wait_ms=5000`. Two `/send-message` calls fire at the broker via `Promise.all([fetch(send1), fetch(send2)])`, both targeting A. Because the broker is single-threaded and `handleSendMessage` has no internal `await` between the waiter lookup and the resolve, the two handlers run to completion sequentially regardless of network dispatch order — the race is deterministic.
 
 **Asserts:**
 - A's long-poll returns with events.length === 1 (the first to arrive resolves the waiter)
 - A subsequent `/poll-messages` (any wait_ms) from A returns events.length === 1 (the second message, now sitting as undelivered)
 - Combined: both messages delivered, no drops
+
+**Invariant being locked in:** the `pendingWaiters.get → delete → resolve` sequence inside `handleSendMessage` must remain atomic (no `await` between those three steps). Future refactors that introduce an `await` in that window MUST reintroduce atomicity (e.g., compare-and-swap pattern) or this test will start flaking.
 
 ### T7 — Unregister cancels pending waiter
 
@@ -234,15 +238,19 @@ All tests go in `broker.test.ts`. Each scenario gets a named `test(...)` block. 
 - response.events.length === 0
 - `pendingWaiters.size === 0` after
 
-### T8 — Broker restart drains pending waiters via client self-heal
+### T8 — Broker restart cleanly resets waiter state (no zombies after restart)
 
-**Scenario:** Peer A is long-polling with `wait_ms=30000`. Broker process is killed (simulate by shutting down the broker server used in the test). A's MCP server attempts self-heal, broker restarts, A reconnects and installs new waiter. A message sent at this point reaches A.
+**Scope (rescoped per reviewer):** broker-side lifecycle only. The test harness already spawns broker as a subprocess via `Bun.spawn(["bun", BROKER_SCRIPT], …)` at `broker.test.ts:74-82`, so killing and respawning is straightforward. This test does NOT cover the full `attemptSelfHeal` integration path in `server.ts` — that requires a server.ts test suite which is a separate gap tracked on the broker-maintainer backlog ("Step B" in the broker-test triage notes).
+
+**Scenario:** Peer A registers against broker instance B1. A fires `/poll-messages` with `wait_ms=30000` (long-poll installed). Test kills `brokerProc` via `brokerProc.kill()`. A's fetch throws (connection drop — expected). Test spawns a replacement broker B2 on the same port with the same DB. Peer A re-registers (new session would do this via self-heal; here we do it manually). A fires a fresh `/poll-messages`, which installs a NEW waiter on B2 — independent of any state B1 had. A message sent after B2 is up reaches A via the new waiter.
 
 **Asserts:**
-- A's original poll throws a connection error (fetch TypeError)
-- After simulated self-heal + reconnect, a new poll succeeds
-- Message sent post-reconnect is delivered via the new waiter
-- **Note:** this test exercises the integration boundary between broker lifecycle and `attemptSelfHeal` — may need to skip in the broker-only test suite and move to an integration-level test. Flag for discussion in review.
+- A's first poll against B1 throws a `TypeError` (fetch failed on socket close)
+- After B2 spawns and A re-registers, a fresh poll succeeds
+- Message sent post-restart is delivered via B2's waiter
+- `GET /debug/waiters` on B2 shows exactly one entry for A during the poll, zero after resolve
+
+**Placement:** last in the file. `bun test` runs source-order by default and `afterAll` DB cleanup should happen after this test to avoid leaking subprocess state into later tests.
 
 ### T9 — `since_id` returns replay without consuming `delivered` flag
 
@@ -279,13 +287,13 @@ All tests go in `broker.test.ts`. Each scenario gets a named `test(...)` block. 
 | Broker-restart drain (integration) | T8 (may defer) |
 | Replay via since_id | T9, T10 |
 
-**Open questions for reviewer:**
+**Resolved by reviewer (rev 2):**
 
-1. T8 is the only test that fundamentally needs broker process lifecycle control (start/kill a child broker). Existing `broker.test.ts` appears to run an in-process broker (to confirm in implementation). If so, T8 may need to become a separate integration test or use in-process broker restart. OK to defer to an integration PR post-slice-2, or must it land in this slice?
+1. **T8 scope** — land in slice 2, broker-side only (not full self-heal integration). broker.test.ts already runs broker as subprocess (`broker.test.ts:74-82`), so lifecycle control is in-harness. Server.ts `attemptSelfHeal` integration coverage is a separate broker-maintainer backlog item and out of scope here.
 
-2. Should `pendingWaiters.size` be exposed for test assertion (debug endpoint, or an export), or do tests infer it purely from black-box behavior? Current stance: black-box is cleaner; if a test *can't* be written without internal introspection (e.g., T5's `size === 0` assert), expose a `/debug/waiters` GET endpoint that's gated behind an env var.
+2. **`pendingWaiters` introspection** — expose `GET /debug/waiters` UNCONDITIONALLY. No env gate. Returns `{ size: N, peers: [{peer_id, age_ms}, …] }`. Documented as debug-only, may change without version bump. `age_ms` computed from `PendingWaiter.installedAt` — which answers the "unused field" finding (F2) in the same stroke.
 
-3. Race scenario #3 (concurrent sends via two resolve attempts) — is the single-threaded JS guarantee sufficient, or should I add explicit test exercising the tight window? My read: single-thread JS event loop makes this race impossible within one broker process; not testing it saves noise. Defer to reviewer.
+3. **Concurrent-send race** — no additional stress test needed; JS single-threading makes the race impossible with the current `handleSendMessage` shape. BUT a mandatory invariant comment must be added at the resolver hook warning future refactors that introduce an `await` between `pendingWaiters.get` and the `delete+resolve` MUST reintroduce atomicity. T6 as revised above locks in the behavioral contract.
 
 ## File structure
 
@@ -437,25 +445,62 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
+### Task 2.5: Reviewer pre-review checkpoint (failing tests)
+
+Per reviewer's meta-suggestion: before implementing the broker side, hand off the failing-tests state for a second pre-review pass. This catches test-shape issues (wrong assertion granularity, brittle timing assumptions, missing invariant coverage) when they're cheap to fix — *before* the broker implementation has to match the assertions.
+
+- [ ] **Step 1: Push the current branch state**
+
+Branch should now have two commits beyond the design doc:
+```
+<sha> test: add T1-T10 long-poll scenarios (failing per TDD)
+<sha> types: add transport-agnostic Event envelope + long-poll fields
+<sha> docs: add slice-2 design with test plan upfront (rev 2)
+```
+
+```bash
+git push origin feat/a2a-lite-slice-2
+```
+
+- [ ] **Step 2: Ping reviewer**
+
+Send a message via `mcp__claude-peers__send_message` to the reviewer peer ID, confirming: (a) all 10 new tests are present and named per Test Plan, (b) they all currently fail for the right reasons (broker returns `messages` not `events`, missing `wait_ms` parameter, etc.), (c) the prior 24 tests remain passing, (d) ready for test-shape review.
+
+- [ ] **Step 3: Wait for reviewer greenlight on the tests themselves**
+
+Do not start Task 3 until reviewer confirms the failing tests match the plan and are failing for the documented reasons. If reviewer requests test changes, iterate here before touching broker code.
+
+---
+
 ### Task 3: Implement broker waiter map + resolver hooks
 
 **Files:**
 - Modify: `broker.ts` — add `pendingWaiters` map, update `/poll-messages`, `/send-message`, `/unregister` handlers.
 
-- [ ] **Step 1: Add the waiter map type + constant**
+- [ ] **Step 1: Add the waiter map type, constants, and BadRequestError**
 
 Near the top of `broker.ts` (after imports, before handlers):
 
 ```typescript
+// Thrown by handlers when input is invalid. The HTTP catch layer maps this
+// to 400 instead of the generic 500. Keeps protocol misuse distinguishable
+// from broker bugs in server logs + client error handling.
+class BadRequestError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "BadRequestError";
+  }
+}
+
 type PendingWaiter = {
   resolve: (response: PollMessagesResponse) => void;
   timeoutHandle: ReturnType<typeof setTimeout>;
-  installedAt: number;
+  installedAt: number;        // ms epoch — surfaced as age_ms in /debug/waiters
 };
 
 const pendingWaiters = new Map<PeerId, PendingWaiter>();
 const DEFAULT_WAIT_MS = 30_000;
-const MAX_WAIT_MS = 120_000;  // safety cap
+const MAX_WAIT_MS = 120_000;  // hard cap; requests exceeding this return 400
 ```
 
 - [ ] **Step 2: Rewrite `handlePollMessages`**
@@ -490,7 +535,16 @@ async function handlePollMessages(
     };
   }
 
-  const waitMs = Math.min(wait_ms ?? DEFAULT_WAIT_MS, MAX_WAIT_MS);
+  // Fail loud on protocol misuse rather than silently clamping — a caller
+  // asking for wait_ms=3_600_000 and getting back at 2 min would be confused.
+  // BadRequestError is caught in the HTTP handler below and mapped to 400;
+  // generic Error still maps to 500. See broker.ts fetch handler.
+  if (wait_ms !== undefined && wait_ms > MAX_WAIT_MS) {
+    throw new BadRequestError(
+      `wait_ms=${wait_ms} exceeds MAX_WAIT_MS=${MAX_WAIT_MS}`
+    );
+  }
+  const waitMs = wait_ms ?? DEFAULT_WAIT_MS;
   if (waitMs <= 0) {
     return { events: [], next_cursor: null };
   }
@@ -527,29 +581,24 @@ function cancelWaiter(id: PeerId): void {
 Inside `handleSendMessage`, after the `insertMessage.run(...)` line and before the return, add:
 
 ```typescript
-  // If target has a pending long-poll waiter, resolve it immediately.
+  // INVARIANT: no `await` between pendingWaiters.get and the delete+resolve
+  // that follows. Atomicity here is the reason T6's concurrent-send test
+  // passes deterministically in single-threaded JS. Future refactors that
+  // introduce an await in this window MUST reintroduce atomicity (e.g.
+  // compare-and-swap pattern) or T6 will start flaking.
   const waiter = pendingWaiters.get(body.to_id);
   if (waiter) {
     clearTimeout(waiter.timeoutHandle);
     pendingWaiters.delete(body.to_id);
 
-    // Fetch the row we just inserted so we return the full message.
-    const inserted = db.query(
-      "SELECT * FROM messages WHERE id = ?"
-    ).get(db.query("SELECT last_insert_rowid() AS id").get() as any)
-      ?? null;
-
-    // Simpler: look up by the highest id for this (from,to) in the last 100 ms.
-    // Cleaner in practice — the insertMessage prepared statement doesn't return
-    // the inserted row; bun:sqlite's last_insert_rowid is scoped to the
-    // connection, so using the same `db` instance is safe.
+    // Fetch the row we just inserted. bun:sqlite's last_insert_rowid() is
+    // scoped to this db connection, so it's safe to use inline.
     const row = db.query(
       "SELECT * FROM messages WHERE id = last_insert_rowid()",
     ).get() as Message;
 
-    // Replay mode doesn't affect waiters — they always get the real row
-    // with normal delivery semantics. Mark delivered since the poll will
-    // consume it.
+    // Mark delivered — the waiter's HTTP response will carry the payload,
+    // so this event is consumed as if the peer had polled normally.
     markDelivered.run(row.id);
 
     waiter.resolve({
@@ -559,8 +608,6 @@ Inside `handleSendMessage`, after the `insertMessage.run(...)` line and before t
   }
 ```
 
-**Note:** The messy double-fetch above can collapse to a single `SELECT * FROM messages WHERE id = last_insert_rowid()` — retained the two-step version in the plan to make the intent obvious. Use the single-query form in the actual implementation.
-
 - [ ] **Step 4: Update `handleUnregister` to cancel the waiter**
 
 At the top of `handleUnregister`, before the existing `markPeerDead.run(...)`:
@@ -569,29 +616,66 @@ At the top of `handleUnregister`, before the existing `markPeerDead.run(...)`:
   cancelWaiter(body.id);
 ```
 
-- [ ] **Step 5: Run tests**
+- [ ] **Step 5: Add `/debug/waiters` GET endpoint and BadRequestError→400 mapping**
+
+Unconditional debug endpoint (localhost-only broker, non-sensitive data, no env gate per reviewer). Add to the `Bun.serve` handler in `broker.ts`:
+
+```typescript
+// In the GET branch of the fetch handler, alongside /health:
+if (path === "/debug/waiters") {
+  const now = Date.now();
+  const peers = Array.from(pendingWaiters.entries()).map(([peer_id, w]) => ({
+    peer_id,
+    age_ms: now - w.installedAt,
+  }));
+  return Response.json({ size: pendingWaiters.size, peers });
+}
+```
+
+Update the POST catch layer to map `BadRequestError` to HTTP 400:
+
+```typescript
+} catch (e) {
+  if (e instanceof BadRequestError) {
+    return Response.json({ error: e.message }, { status: 400 });
+  }
+  const msg = e instanceof Error ? e.message : String(e);
+  return Response.json({ error: msg }, { status: 500 });
+}
+```
+
+Document in `README.md` under a new "Debug endpoints" heading:
+
+> `GET /debug/waiters` — localhost-only introspection into the broker's in-memory long-poll waiter map. Returns `{ size: number, peers: [{peer_id, age_ms}, …] }`. Debug-only, format may change without version bump.
+
+- [ ] **Step 6: Run tests**
 
 ```bash
 bun test broker.test.ts
 ```
 
-Expected: T1-T7, T9, T10 pass. T8 (broker-restart) may still fail depending on integration-test approach — OK to leave failing here if explicitly deferred per reviewer discussion. Existing 24 tests still pass.
+Expected: all of T1-T10 pass (T8 now lands in slice 2 per reviewer rescope). Existing 24 tests still pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add broker.ts
+git add broker.ts README.md
 git commit -m "broker: long-poll /poll-messages with in-memory waiter map
 
-Install pendingWaiters Map<PeerId, {resolve, timeoutHandle}>. 
+Install pendingWaiters Map<PeerId, {resolve, timeoutHandle, installedAt}>. 
 /poll-messages: if no pending events, install a waiter with wait_ms
 timeout; resolve on message arrival or timeout. Second poll from the
 same peer cancels the first (connection-reset reconnect safety).
 /send-message: resolve target's waiter with the new event before
-HTTP response. /unregister: cancel any pending waiter.
+HTTP response (atomic get/delete/resolve — invariant commented).
+/unregister: cancel any pending waiter.
 
 since_id enables read-only replay (ignores delivered flag). wait_ms=0
-is the fast path used by check_messages tool.
+is the fast path used by check_messages tool. wait_ms > MAX_WAIT_MS
+fails loud with HTTP 400 via BadRequestError.
+
+New /debug/waiters GET endpoint (unconditional, localhost-only)
+exposes { size, peers: [{peer_id, age_ms}] } for introspection.
 
 Slice 2 of A2A-lite plan.
 
@@ -656,17 +740,33 @@ let pollLoopActive = true;
 })();
 ```
 
-Update the cleanup handler (`server.ts:755-773`) to flip the flag:
+Update the cleanup handler (`server.ts:755-773`) with explicit ordering so SIGTERM doesn't block for up to 30 s waiting for the long-poll to return on its own:
 
 ```typescript
   const cleanup = async () => {
+    // Order matters: flip the flag BEFORE /unregister. The /unregister
+    // call cancels the broker-side waiter (handleUnregister calls
+    // cancelWaiter), which resolves the long-poll with empty events,
+    // which unblocks pollAndPushMessages, which returns to the while
+    // loop, which sees pollLoopActive=false and exits. Without this
+    // ordering the flag-check happens only after the 30s timeout fires.
     pollLoopActive = false;
     clearInterval(heartbeatTimer);
-    // ... rest unchanged
+    if (myId) {
+      try {
+        await brokerFetch("/unregister", { id: myId });
+        log("Unregistered from broker");
+      } catch {
+        // Best effort
+      }
+    }
+    process.exit(0);
   };
 ```
 
-Delete the now-unused `POLL_INTERVAL_MS` constant at server.ts:39 (or leave deprecated with a comment — either is fine; prefer deletion).
+The existing `clearInterval(pollTimer)` line is removed — there's no longer a `pollTimer`; the driver loop replaces it.
+
+Delete the now-unused `POLL_INTERVAL_MS` constant at server.ts:39.
 
 - [ ] **Step 3: Update `check_messages` tool to pass `wait_ms: 0`**
 
@@ -689,7 +789,7 @@ bun build broker.ts --target=bun --outdir=/tmp/claude-peers-typecheck
 bun test
 ```
 
-Expected: both builds exit 0; all tests (including T1-T10 except possibly T8) pass; existing 24 regression tests pass.
+Expected: both builds exit 0; all T1-T10 pass (T8 included per rescope); existing 24 regression tests pass.
 
 - [ ] **Step 5: Manual smoke test**
 
@@ -727,17 +827,17 @@ bun test
 git log --oneline main..HEAD
 ```
 
-Expected: builds clean; all tests pass (minus T8 if explicitly deferred); 5 commits on the branch:
+Expected: builds clean; all T1-T10 pass (T8 included); 5 commits on the branch:
 
 ```
 <sha> server: switch to long-poll driver loop (replaces setInterval)
 <sha> broker: long-poll /poll-messages with in-memory waiter map
 <sha> test: add T1-T10 long-poll scenarios (failing per TDD)
 <sha> types: add transport-agnostic Event envelope + long-poll fields
-<sha> docs: add slice-2 design with test plan upfront
+<sha> docs: add slice-2 design with test plan upfront (rev 2)
 ```
 
-(The docs commit is the one this task list itself lands under.)
+(The docs commit is the one this task list itself lands under; rev 2 suffix reflects reviewer pre-review incorporation.)
 
 - [ ] **Step 2: Stop and surface for review**
 
