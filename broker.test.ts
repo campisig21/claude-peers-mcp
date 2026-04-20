@@ -2622,7 +2622,12 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
     }
   });
 
-  test("F4: SSE tail sees suppressed events (push flag included, not filtered)", async () => {
+  test("F4: SSE tail sees all events — push reflects receiver-independent rule only (D10)", async () => {
+    // Per D10: SSE's push field reflects the receiver-independent portion
+    // of shouldPush — currently just rule 3 (state_change→working). A
+    // dispatch event is not rule 3, so its SSE frame shows push=true even
+    // when observers are present (observer is a per-receiver rule, not
+    // evaluated on SSE).
     const { reader, cancel } = await openSse();
     try {
       const a = await registerPeer({ summary: "A" });
@@ -2637,13 +2642,42 @@ describe("A2A-lite SSE tail (Slice 6)", () => {
       const frames = await readFrames(reader, 1);
       const te = frames.find((f) => f.type === "task_event");
       expect(te).toBeDefined();
-      // The frame envelope always carries push. Value depends on receiver;
-      // the tail is broadcast and doesn't apply shouldPush — the emitted
-      // `push` reflects the sender-side default of the ENVELOPE, not any
-      // specific receiver. For broadcast we set push=true on the envelope
-      // so tail consumers see the un-suppressed default.
       expect(te!.push).toBe(true);
       for (const p of [a, b, c]) {
+        await brokerFetch("/unregister", { id: p.id });
+        await killPeer(p.proc);
+      }
+    } finally {
+      await cancel();
+    }
+  });
+
+  test("F4b: SSE frame shows push=false for state_change→working (rule 3 is receiver-independent)", async () => {
+    const { reader, cancel } = await openSse();
+    try {
+      const a = await registerPeer({ summary: "A" });
+      const b = await registerPeer({ summary: "B" });
+      const disp = await brokerFetch<{ task_id: string }>("/dispatch-task", {
+        from_id: a.id,
+        title: "rule-3 test",
+        participants: [b.id],
+      });
+      const tid = disp.data.task_id;
+      await brokerFetch("/send-task-event", {
+        from_id: b.id,
+        task_id: tid,
+        intent: "state_change",
+        data: { to: "working" },
+      });
+      const frames = await readFrames(reader, 2);
+      const sc = frames.find((f) =>
+        f.type === "task_event" &&
+        (f.payload as { intent: string }).intent === "state_change"
+      );
+      expect(sc).toBeDefined();
+      expect(sc!.push).toBe(false);
+
+      for (const p of [a, b]) {
         await brokerFetch("/unregister", { id: p.id });
         await killPeer(p.proc);
       }

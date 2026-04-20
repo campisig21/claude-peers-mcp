@@ -103,6 +103,34 @@ Operational framing: the tail is a **forensic/observability view** owned by the 
 
 Implication for fan-out implementation: the broadcast call happens AFTER the DB write AND AFTER the delivery-state mutations (cursor upserts, `delivered` flag flips, waiter resolves). The tail observes the *already-committed* event, not a preview. If a subscriber throws during broadcast, delivery semantics for regular peers are unaffected — per D4's per-subscriber drop-on-error.
 
+### D10. `push` field on SSE frames reflects only the receiver-independent rule (rule 3)
+
+Problem identified during Task 2.5 pre-review (reviewer observation A3): `push` is per-receiver in `/poll-messages`. The broker calls `shouldPush(event, receiver)` and different receivers get different push values for the same event (observer → false, targeted question's target → true, etc.). But SSE has no receiver identity — it's broadcast.
+
+Resolution: on SSE frames, `push` is computed with **only the receiver-independent rule** — rule 3 (`state_change → working` is universally suppressed). All other rules (1 observer, 2 sender, 4 targeted question, 5 targeted answer) require receiver.peer_id to evaluate and are skipped on SSE.
+
+Formally:
+
+```typescript
+// Broker-side (shared helper):
+function ssePushValue(event: TaskEvent): boolean {
+  if (event.intent === "state_change" && event.data) {
+    try { if (JSON.parse(event.data).to === "working") return false; } catch { /* noop */ }
+  }
+  return true;
+}
+```
+
+Semantic guarantee: the `push` value on an SSE frame answers "would this event push to a generic participant who is neither sender, target, nor observer?" — which is the only question about this event that can be answered without knowing the receiver. Rules 4/5 evaluate to "push=true for the specific target, push=false for everyone else" — and because SSE doesn't have a specific target, the more permissive default wins.
+
+For message events on SSE: `push: true` always (unchanged from slice 5's D4 — messages never apply shouldPush).
+
+Test F4 comment updated to reflect this: the observer-with-dispatch scenario's SSE frame shows `push: true` (dispatch is not rule 3, so it's not suppressed receiver-independently). A new F4b locks in the rule-3 behavior: send a `state_change → working` event, assert the SSE frame shows `push: false`. F4's original intent ("observer's push=false appears") is INCORRECT — push on SSE is not the observer's push; it's the generic-receiver push. F4 will be updated to test a valid assertion.
+
+Consistency with /poll-messages: a CLI-side operator who wants to know "which receivers actually got an interrupt for this event?" must cross-reference the SSE stream with /poll-messages responses. SSE's push field is a fast-path "at-least-one-non-special-receiver-would-push" indicator; for receiver-specific truth, query the per-peer poll response.
+
+Alternative considered (option 3 from reviewer): omit push on SSE frames entirely. Rejected because it breaks D4's "always-explicit push on slice-5+ envelopes" invariant — keeping the field with a clear receiver-independent semantic preserves envelope uniformity.
+
 ### D8. Test strategy — broker-side uses native `fetch` + `ReadableStream.getReader()`; CLI-side spawns subprocess
 
 SSE is a streaming protocol; tests need to start a connection, send events, observe them on the wire, then close. bun's test runner supports `fetch` with body streaming; we read via `getReader()` and assert on decoded chunks.
