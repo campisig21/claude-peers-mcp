@@ -201,6 +201,15 @@ to notify a role without knowing its current peer ID. Set
 | `CLAUDE_PEER_ROLE`   | —                    | Role claim for stable peer IDs across restarts (see "Stable role names")  |
 | `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano                                     |
 
+## Debug endpoints
+
+The broker exposes diagnostic endpoints on the same port. All are localhost-only and non-sensitive.
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/health` | GET | Broker status, version fingerprint, active peer count. Stable contract. |
+| `/debug/waiters` | GET | In-memory long-poll waiter map. Returns `{ size: number, peers: [{peer_id, age_ms}, …] }`. Debug-only — format may change without version bump. |
+
 ## Requirements
 
 - [Bun](https://bun.sh)
