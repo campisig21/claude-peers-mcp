@@ -662,3 +662,375 @@ describe("CLI send-by-role", () => {
     await killPeer(proc);
   });
 });
+
+// ---- Long-poll transport (Slice 2: T1-T10) ----
+//
+// These tests lock in the wire contract for the long-poll transport
+// landing in broker.ts Task 3. ALL T1-T10 will fail until Task 3 lands —
+// that's intentional per TDD. See docs/a2a-lite-slice-2.md §"Test Plan"
+// for the design rationale behind each test.
+
+type LongPollEvent = {
+  event_id: number;
+  type: "message" | "task_event";
+  payload: {
+    id: number;
+    from_id: string;
+    to_id: string;
+    text: string;
+    sent_at: string;
+    delivered: boolean | number;
+  };
+};
+
+type LongPollResponse = {
+  events: LongPollEvent[];
+  next_cursor: number | null;
+};
+
+type DebugWaitersResponse = {
+  size: number;
+  peers: { peer_id: string; age_ms: number }[];
+};
+
+describe("Long-poll transport (Slice 2)", () => {
+  test("T1 — long-poll resolves when a message arrives mid-block", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t1-a" });
+    const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t1-b" });
+    const started = Date.now();
+
+    const pollPromise = brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 5000 }
+    );
+
+    await new Promise((r) => setTimeout(r, 50));
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "hello T1" });
+
+    const { data } = await pollPromise;
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(500);
+    expect(data.events.length).toBe(1);
+    expect(data.events[0]!.type).toBe("message");
+    expect(data.events[0]!.payload.text).toBe("hello T1");
+    expect(data.next_cursor).toBe(data.events[0]!.event_id);
+
+    await brokerFetch("/unregister", { id: aid });
+    await brokerFetch("/unregister", { id: bid });
+    await killPeer(pa);
+    await killPeer(pb);
+  });
+
+  test("T2 — long-poll times out cleanly when no message arrives", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t2-a" });
+    const started = Date.now();
+
+    const { data } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 500 }
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeGreaterThanOrEqual(500);
+    expect(elapsed).toBeLessThan(1000);
+    expect(data.events.length).toBe(0);
+    expect(data.next_cursor).toBe(null);
+
+    await brokerFetch("/unregister", { id: aid });
+    await killPeer(pa);
+  });
+
+  test("T3 — wait_ms=0 fast path returns immediately with no pending", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t3-a" });
+    const started = Date.now();
+
+    const { data } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0 }
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(100);
+    expect(data.events.length).toBe(0);
+    expect(data.next_cursor).toBe(null);
+
+    await brokerFetch("/unregister", { id: aid });
+    await killPeer(pa);
+  });
+
+  test("T4 — wait_ms=0 with pending events returns them immediately", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t4-a" });
+    const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t4-b" });
+
+    // Tiny gap between sends so sent_at is distinct
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "m1" });
+    await new Promise((r) => setTimeout(r, 2));
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "m2" });
+
+    const started = Date.now();
+    const { data } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0 }
+    );
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(100);
+    expect(data.events.length).toBe(2);
+    expect(data.events.map((e) => e.payload.text)).toEqual(["m1", "m2"]);
+
+    await brokerFetch("/unregister", { id: aid });
+    await brokerFetch("/unregister", { id: bid });
+    await killPeer(pa);
+    await killPeer(pb);
+  });
+
+  test("T5 — waiter replacement: second poll supersedes first", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t5-a" });
+    const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t5-b" });
+
+    const poll1 = brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 5000 }
+    );
+    await new Promise((r) => setTimeout(r, 50));
+
+    const poll2 = brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 5000 }
+    );
+
+    // poll1 returns quickly — cancelled when poll2 installs its waiter
+    const { data: d1 } = await poll1;
+    expect(d1.events.length).toBe(0);
+    expect(d1.next_cursor).toBe(null);
+
+    await new Promise((r) => setTimeout(r, 50));
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "T5 winner" });
+
+    const { data: d2 } = await poll2;
+    expect(d2.events.length).toBe(1);
+    expect(d2.events[0]!.payload.text).toBe("T5 winner");
+
+    // Waiter map entry for aid should be gone after resolution
+    const { data: debug } = await brokerFetch<DebugWaitersResponse>("/debug/waiters");
+    expect(debug.peers.find((p) => p.peer_id === aid)).toBeUndefined();
+
+    await brokerFetch("/unregister", { id: aid });
+    await brokerFetch("/unregister", { id: bid });
+    await killPeer(pa);
+    await killPeer(pb);
+  });
+
+  test("T6 — concurrent sends deliver both (one via waiter, one via DB)", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t6-a" });
+    const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t6-b" });
+
+    const pollPromise = brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 5000 }
+    );
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Promise.all fires both. JS single-threading + atomic handleSendMessage
+    // (no await between pendingWaiters.get and the delete+resolve) means
+    // broker serializes them deterministically.
+    await Promise.all([
+      brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "first" }),
+      brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "second" }),
+    ]);
+
+    const { data: d1 } = await pollPromise;
+    expect(d1.events.length).toBe(1);
+    // Whichever handler hit pendingWaiters.get first resolved the waiter.
+    // The OTHER is now sitting as undelivered.
+    const firstText = d1.events[0]!.payload.text;
+    expect(["first", "second"]).toContain(firstText);
+
+    const { data: d2 } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0 }
+    );
+    expect(d2.events.length).toBe(1);
+    const otherText = d2.events[0]!.payload.text;
+    expect(otherText).not.toBe(firstText);
+    expect(["first", "second"]).toContain(otherText);
+
+    await brokerFetch("/unregister", { id: aid });
+    await brokerFetch("/unregister", { id: bid });
+    await killPeer(pa);
+    await killPeer(pb);
+  });
+
+  test("T7 — unregister cancels pending waiter", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t7-a" });
+
+    const pollPromise = brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 30000 }
+    );
+    await new Promise((r) => setTimeout(r, 50));
+
+    const unregisterStart = Date.now();
+    await brokerFetch("/unregister", { id: aid });
+
+    const { data } = await pollPromise;
+    const pollReturnedAt = Date.now();
+
+    expect(pollReturnedAt - unregisterStart).toBeLessThan(500);
+    expect(data.events.length).toBe(0);
+    expect(data.next_cursor).toBe(null);
+
+    const { data: debug } = await brokerFetch<DebugWaitersResponse>("/debug/waiters");
+    expect(debug.peers.find((p) => p.peer_id === aid)).toBeUndefined();
+
+    await killPeer(pa);
+  });
+
+  test("T9 — since_id returns replay without consuming delivered flag", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t9-a" });
+    const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t9-b" });
+
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "m1" });
+    await new Promise((r) => setTimeout(r, 2));
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "m2" });
+    await new Promise((r) => setTimeout(r, 2));
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "m3" });
+
+    // First poll consumes all, marks delivered
+    const { data: d1 } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0 }
+    );
+    expect(d1.events.length).toBe(3);
+    const firstEventId = d1.events[0]!.event_id;
+
+    // Replay via since_id — ignores delivered flag
+    const { data: d2 } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0, since_id: firstEventId - 1 }
+    );
+    expect(d2.events.length).toBe(3);
+    expect(d2.events.map((e) => e.payload.text)).toEqual(["m1", "m2", "m3"]);
+
+    // Normal poll after replay should be empty — replay is read-only
+    const { data: d3 } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0 }
+    );
+    expect(d3.events.length).toBe(0);
+
+    await brokerFetch("/unregister", { id: aid });
+    await brokerFetch("/unregister", { id: bid });
+    await killPeer(pa);
+    await killPeer(pb);
+  });
+
+  test("T10 — since_id=0 returns all messages for peer regardless of delivered", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t10-a" });
+    const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t10-b" });
+
+    // Send 3, consume them (delivered=1)
+    for (let i = 1; i <= 3; i++) {
+      await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: `m${i}` });
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const { data: consumed } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0 }
+    );
+    expect(consumed.events.length).toBe(3);
+
+    // Send 2 more (undelivered)
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "m4" });
+    await new Promise((r) => setTimeout(r, 2));
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "m5" });
+
+    // since_id=0 returns all 5 regardless of delivery state
+    const { data: replay } = await brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 0, since_id: 0 }
+    );
+    expect(replay.events.length).toBe(5);
+    expect(replay.events.map((e) => e.payload.text)).toEqual(["m1", "m2", "m3", "m4", "m5"]);
+
+    await brokerFetch("/unregister", { id: aid });
+    await brokerFetch("/unregister", { id: bid });
+    await killPeer(pa);
+    await killPeer(pb);
+  });
+});
+
+// T8 lives in its own describe at the END of the file because it
+// restarts the broker subprocess. afterAll's brokerProc.kill() hits
+// the replacement broker that T8 spawns (reassigned to the module-scoped
+// variable).
+describe("Long-poll broker restart (T8 — LAST in file)", () => {
+  test("T8 — broker restart cleanly resets waiter state (no zombies after restart)", async () => {
+    const { id: aid, proc: pa } = await registerPeer({ cwd: "/tmp/t8-a" });
+    const { id: bid, proc: pb } = await registerPeer({ cwd: "/tmp/t8-b" });
+
+    const originalPollPromise = brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 30000 }
+    );
+    // Expected to reject when B1 dies mid-flight — silence the rejection
+    originalPollPromise.catch(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Kill B1
+    brokerProc.kill();
+    await brokerProc.exited;
+
+    // Spawn replacement B2 on same port+DB. Reassign module-scoped brokerProc
+    // so afterAll cleans up B2.
+    brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_PORT: String(TEST_PORT),
+        CLAUDE_PEERS_DB: TEST_DB,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    // Wait for B2 health (same pattern as beforeAll)
+    let b2Ready = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        const res = await fetch(`${BROKER_URL}/health`);
+        if (res.ok) { b2Ready = true; break; }
+      } catch { /* not yet */ }
+    }
+    expect(b2Ready).toBe(true);
+
+    // B2 starts with empty waiter map
+    const { data: debugAfterRestart } = await brokerFetch<DebugWaitersResponse>(
+      "/debug/waiters"
+    );
+    expect(debugAfterRestart.size).toBe(0);
+
+    // New waiter installs on B2; new send resolves it
+    const newPollPromise = brokerFetch<LongPollResponse>(
+      "/poll-messages",
+      { id: aid, wait_ms: 5000 }
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    await brokerFetch("/send-message", { from_id: bid, to_id: aid, text: "post-restart" });
+
+    const { data } = await newPollPromise;
+    expect(data.events.length).toBe(1);
+    expect(data.events[0]!.payload.text).toBe("post-restart");
+
+    // Waiter cleared after resolution
+    const { data: debugAfterResolve } = await brokerFetch<DebugWaitersResponse>(
+      "/debug/waiters"
+    );
+    expect(debugAfterResolve.peers.find((p) => p.peer_id === aid)).toBeUndefined();
+
+    await brokerFetch("/unregister", { id: aid });
+    await brokerFetch("/unregister", { id: bid });
+    await killPeer(pa);
+    await killPeer(pb);
+  });
+});
