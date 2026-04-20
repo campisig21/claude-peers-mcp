@@ -21,6 +21,7 @@ import type {
   PollMessagesRequest,
   PollMessagesResponse,
   Peer,
+  PeerId,
   Message,
 } from "./shared/types.ts";
 
@@ -191,13 +192,63 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0)
 `);
 
+// ORDER BY id (not sent_at) so next_cursor is monotonic with event_id,
+// matching the since_id replay path's ordering. id is AUTOINCREMENT so this
+// is also insertion-order-stable when two sends land in the same millisecond.
 const selectUndelivered = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
+  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY id ASC
+`);
+
+// Replay mode: return all messages for a peer with id > since_id, regardless
+// of `delivered` flag. Read-only — does NOT mark events delivered.
+const selectSinceId = db.prepare(`
+  SELECT * FROM messages WHERE to_id = ? AND id > ? ORDER BY id ASC
 `);
 
 const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
+
+// Used by handleSendMessage to fetch the just-inserted row. bun:sqlite's
+// last_insert_rowid() is scoped to this connection, so this is safe as long
+// as the INSERT and SELECT happen on the same `db` instance (they do).
+const selectJustInserted = db.prepare(`
+  SELECT * FROM messages WHERE id = last_insert_rowid()
+`);
+
+// --- Long-poll waiter state ---
+//
+// In-memory map of peers currently blocked on /poll-messages. When
+// /send-message inserts a row for a target in this map, the waiter is
+// resolved immediately — zero-latency delivery. When the timeout fires
+// or /unregister is called, the waiter is cancelled with an empty
+// response. One waiter per peer; a second poll from the same peer
+// cancels and replaces the first (connection-reset reconnect safety).
+
+class BadRequestError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "BadRequestError";
+  }
+}
+
+type PendingWaiter = {
+  resolve: (response: PollMessagesResponse) => void;
+  timeoutHandle: ReturnType<typeof setTimeout>;
+  installedAt: number; // ms epoch — surfaced as age_ms in /debug/waiters
+};
+
+const pendingWaiters = new Map<PeerId, PendingWaiter>();
+const DEFAULT_WAIT_MS = 30_000;
+const MAX_WAIT_MS = 120_000; // hard cap; requests exceeding this return 400
+
+function cancelWaiter(id: PeerId): void {
+  const w = pendingWaiters.get(id);
+  if (!w) return;
+  clearTimeout(w.timeoutHandle);
+  pendingWaiters.delete(id);
+  w.resolve({ events: [], next_cursor: null });
+}
 
 // --- Generate peer ID ---
 //
@@ -407,21 +458,97 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   }
 
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+
+  // INVARIANT: no `await` between pendingWaiters.get and the delete+resolve
+  // that follows. Atomicity here is the reason T6's concurrent-send test
+  // passes deterministically in single-threaded JS. Future refactors that
+  // introduce an await in this window MUST reintroduce atomicity (e.g.
+  // compare-and-swap pattern) or T6 will start flaking.
+  const waiter = pendingWaiters.get(body.to_id);
+  if (waiter) {
+    clearTimeout(waiter.timeoutHandle);
+    pendingWaiters.delete(body.to_id);
+
+    const row = selectJustInserted.get() as Message;
+    markDelivered.run(row.id);
+
+    waiter.resolve({
+      events: [{ event_id: row.id, type: "message", payload: row }],
+      next_cursor: row.id,
+    });
+  }
+
   return { ok: true };
 }
 
-function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+function handlePollMessages(body: PollMessagesRequest): Promise<PollMessagesResponse> {
+  const { id, wait_ms, since_id } = body;
 
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
+  // Fail loud on protocol misuse rather than silent clamp. BadRequestError
+  // is mapped to HTTP 400 in the fetch handler; generic Error maps to 500.
+  if (wait_ms !== undefined && wait_ms > MAX_WAIT_MS) {
+    throw new BadRequestError(
+      `wait_ms=${wait_ms} exceeds MAX_WAIT_MS=${MAX_WAIT_MS}`
+    );
   }
 
-  return { messages };
+  // Gather any immediately-available events. Replay mode (since_id) is
+  // read-only — does NOT mark events delivered. Normal mode consumes the
+  // `delivered=0` queue and marks each row on the way out.
+  const pending = since_id !== undefined
+    ? (selectSinceId.all(id, since_id) as Message[])
+    : (selectUndelivered.all(id) as Message[]);
+
+  if (pending.length > 0) {
+    if (since_id === undefined) {
+      for (const m of pending) markDelivered.run(m.id);
+    }
+    return Promise.resolve({
+      events: pending.map((m) => ({
+        event_id: m.id,
+        type: "message" as const,
+        payload: m,
+      })),
+      next_cursor: pending[pending.length - 1]!.id,
+    });
+  }
+
+  const waitMs = wait_ms ?? DEFAULT_WAIT_MS;
+  if (waitMs <= 0) {
+    return Promise.resolve({ events: [], next_cursor: null });
+  }
+
+  // Install waiter, replacing any prior one for this peer. Replacement
+  // exists for the connection-reset-reconnect case: a peer whose previous
+  // long-poll connection died will retry; the second poll cancels the
+  // first (resolving it with empty events) and installs fresh.
+  cancelWaiter(id);
+
+  return new Promise<PollMessagesResponse>((resolve) => {
+    const timeoutHandle = setTimeout(() => {
+      // Guard against resolve-vs-timeout race: if the current entry in
+      // the map isn't this one, someone else (send-message resolve or
+      // cancelWaiter) got here first; no-op.
+      if (pendingWaiters.get(id)?.timeoutHandle === timeoutHandle) {
+        pendingWaiters.delete(id);
+        resolve({ events: [], next_cursor: null });
+      }
+    }, waitMs);
+    pendingWaiters.set(id, {
+      resolve,
+      timeoutHandle,
+      installedAt: Date.now(),
+    });
+  });
 }
 
 function handleUnregister(body: { id: string }): void {
+  // Cancel any pending long-poll waiter BEFORE marking dead so the poll
+  // resolves with empty events. This closes the cleanup-latency window on
+  // server-side SIGTERM (MCP server's cleanup handler calls /unregister;
+  // the waiter resolve unblocks its driver loop which then exits cleanly).
+  cancelWaiter(body.id);
+
   // Mark dead instead of deleting so that a role bound to this peer can be
   // reclaimed by a future session registering with the same CLAUDE_PEER_ROLE.
   // Without this, a clean SIGTERM/SIGINT would lose the binding and the next
@@ -447,6 +574,16 @@ Bun.serve({
           version: BROKER_VERSION,
         });
       }
+      // Debug-only introspection into the long-poll waiter map.
+      // Unconditional per slice-2 design — localhost-only broker, non-
+      // sensitive data. Format may change without version bump.
+      if (path === "/debug/waiters") {
+        const now = Date.now();
+        const peers = Array.from(pendingWaiters.entries()).map(
+          ([peer_id, w]) => ({ peer_id, age_ms: now - w.installedAt })
+        );
+        return Response.json({ size: pendingWaiters.size, peers });
+      }
       return new Response("claude-peers broker", { status: 200 });
     }
 
@@ -469,7 +606,7 @@ Bun.serve({
         case "/send-message":
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
+          return Response.json(await handlePollMessages(body as PollMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
@@ -477,6 +614,9 @@ Bun.serve({
           return Response.json({ error: "not found" }, { status: 404 });
       }
     } catch (e) {
+      if (e instanceof BadRequestError) {
+        return Response.json({ error: e.message }, { status: 400 });
+      }
       const msg = e instanceof Error ? e.message : String(e);
       return Response.json({ error: msg }, { status: 500 });
     }
