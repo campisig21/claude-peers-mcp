@@ -139,6 +139,14 @@ Per parent spec: `Event<TaskEvent>` payload = `{ id, task_id, intent, from_id, t
 
 MCP server renders the channel notification text as: `[task T-34] dispatch from quiet-comet: Implement schema migrations…`. The bracket prefix distinguishes typed events from ad-hoc messages in the notification stream.
 
+### D10. Role rebind inherits prior task participation (intentional)
+
+When a role-bound peer dies and a new session registers with the same `CLAUDE_PEER_ROLE`, the broker's revive path (broker.ts `revivePeerByRole`) returns the SAME peer_id as the dead holder. Because `task_participants.peer_id` references this stable id, the revived session automatically becomes a participant on every task the prior holder was dispatched to. This is consistent with role-binding identity stability — the entire point of role-binding is "same identity across session restarts" — and is lock-in tested by R3.
+
+Rationale: tasks address participants by peer_id, not by role name. Revive path preserves peer_id by design (to keep summary, pending messages, role claim intact). Task participation is already addressed by peer_id, so inheritance is a direct consequence of the existing revive semantics, not a new design choice.
+
+Implication for the user: a session claiming a role via `CLAUDE_PEER_ROLE=<role>` should expect to inherit the prior holder's full context — open tasks, pending channel messages, role claim. The footgun (a different human unexpectedly claiming a shared role) exists at the role-binding layer and is not introduced or amplified by slice 4. Documented here so future readers don't rediscover this by surprise.
+
 ### D9. No atomic "resolve all participant waiters" — sequential is fine
 
 When a task_event lands and has N participants with pending waiters, the broker resolves them one at a time in a `for` loop. Between `pendingWaiters.get(pA)` and `resolve(...)` there is no `await` (sync SQLite calls, sync Map ops); the loop iterates through all participants before returning. Even if the handler yields mid-loop (it doesn't, but hypothetically), each per-participant resolve is atomic.
@@ -527,11 +535,12 @@ Dispatch task. Read file. Assert contains `# T-<n>`, `state: open`, `participant
 Dispatch + send_task_event. Read file. Assert 2 event sections (dispatch + state_change) separated by blank line.
 
 **F3. fs write failure doesn't block the handler.**
-Stub `fs.appendFile` (via mock) to throw EACCES. Call `/send-task-event`. Assert:
+Apply `fs.chmodSync(taskFile, 0o400)` to the task markdown file **after dispatch creates it** (not to the tasks directory — the directory must remain readable+searchable at 0o700 so the broker can stat other files). This forces the subsequent `/send-task-event`'s `fs.appendFile` into EACCES natively — no `mock.module` machinery. Call `/send-task-event`. Assert:
 - Handler returns HTTP 200.
 - DB row exists.
-- Broker stderr contains "audit write failed".
+- Broker stderr contains "audit write failed" (or equivalent log line).
 - Waiter resolution still happens.
+- Test restores mode to 0o600 in a `try/finally` so afterAll teardown can `rm` the file.
 
 **F4. Task files live under `~/.claude-peers/tasks/`.**
 Assert the directory exists after broker startup.
