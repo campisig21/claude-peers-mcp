@@ -2173,7 +2173,13 @@ describe("A2A-lite push policy (Slice 5)", () => {
     }
   });
 
-  test("R2: sender never receives delivery (slice-4 regression)", async () => {
+  test("R2: sender-exclusion regression (slice-4 delivery-layer, NOT shouldPush)", async () => {
+    // This test verifies sender exclusion is enforced at the delivery layer
+    // (selectTaskEventsSincePeer's `te.from_id != ?` filter + the sender-skip
+    // in deliverTaskEventToPeer from slice 4). The shouldPush sender rule
+    // (D7, defense-in-depth) is never reached on this path because the sender
+    // never gets a task_event in their poll batch. If a future refactor
+    // removes the delivery-layer filter, D7 becomes the load-bearing rule.
     const a = await registerPeer({ summary: "A" });
     const b = await registerPeer({ summary: "B" });
     await dispatchS5(a.id, [b.id]);
@@ -2363,7 +2369,7 @@ describe("A2A-lite push policy (Slice 5)", () => {
 
   // ---- I: Integration — Appendix A worked example ----
 
-  test("I1: Appendix A full cycle yields 9 total pushes (A=4, B=3, C=2)", async () => {
+  test("I1: Appendix A full cycle yields 10 total pushes (A=4, B=4, C=2)", async () => {
     // A=coordinator, B=impl, C=reviewer. Parent spec Appendix A.
     const a = await registerPeer({ summary: "coordinator" });
     const b = await registerPeer({ summary: "impl-backend-A" });
@@ -2394,9 +2400,17 @@ describe("A2A-lite push policy (Slice 5)", () => {
       for (const e of events) if (e.push === true) counts[label]++;
     }
 
-    // Expected per Appendix A: A=4 pushes, B=3, C=2 → total 9.
+    // Expected from re-derivation against the rules (spec table, not the
+    // summary — see design-doc amendment noting the parent-spec inconsistency):
+    //   A (coord): pushes on events 3, 5, 7, 8 = 4
+    //   B (impl):  pushes on events 1, 4, 7, 8 = 4
+    //   C (rev):   pushes on events 1, 5 = 2
+    //   Total: 10 of 24 receiver-event pairs → 58% suppression.
+    // Parent spec §Appendix A summary states impl=3/total=9; table-derived
+    // count is impl=4/total=10. Separate docs fix-up commit in this slice
+    // corrects docs/a2a-lite.md §Appendix A.
     expect(counts.a).toBe(4);
-    expect(counts.b).toBe(3);
+    expect(counts.b).toBe(4);
     expect(counts.c).toBe(2);
 
     for (const p of [a, b, c]) {
