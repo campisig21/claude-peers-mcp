@@ -7,6 +7,7 @@ import type { PollMessagesResponse } from "./shared/types.ts";
 
 const TEST_PORT = 17899;
 const TEST_DB = path.join(os.tmpdir(), `claude-peers-test-${Date.now()}.db`);
+const TEST_HOME = path.join(os.tmpdir(), `claude-peers-test-home-${Date.now()}`);
 const BROKER_URL = `http://127.0.0.1:${TEST_PORT}`;
 const BROKER_SCRIPT = path.join(import.meta.dir, "broker.ts");
 
@@ -79,6 +80,7 @@ beforeAll(async () => {
       ...process.env,
       CLAUDE_PEERS_PORT: String(TEST_PORT),
       CLAUDE_PEERS_DB: TEST_DB,
+      CLAUDE_PEERS_HOME: TEST_HOME,
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -106,6 +108,7 @@ afterAll(async () => {
   try { fs.unlinkSync(TEST_DB); } catch {}
   try { fs.unlinkSync(TEST_DB + "-wal"); } catch {}
   try { fs.unlinkSync(TEST_DB + "-shm"); } catch {}
+  try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch {}
 });
 
 // ---- Health endpoint ----
@@ -1243,6 +1246,829 @@ describe("A2A-lite schema (Slice 3)", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe("A2A-lite typed tools (Slice 4)", () => {
+  // All tests here exercise the broker endpoints that slice 4 will add.
+  // Against current main, every assertion that hits /dispatch-task or
+  // /send-task-event returns 404, so tests fail deterministically until
+  // Task 3 lands the handlers.
+
+  const TASKS_DIR = path.join(TEST_HOME, "tasks");
+
+  interface DispatchResp {
+    task_id: string;
+    participants: string[];
+    event_id: number;
+  }
+
+  async function dispatchTask(
+    fromId: string,
+    participants: string[],
+    opts: {
+      title?: string;
+      text?: string;
+      data?: Record<string, unknown>;
+      context_id?: string;
+    } = {}
+  ): Promise<{ status: number; data: DispatchResp | { error: string } }> {
+    return brokerFetch<DispatchResp | { error: string }>("/dispatch-task", {
+      from_id: fromId,
+      title: opts.title ?? "test task",
+      participants,
+      context_id: opts.context_id,
+      text: opts.text,
+      data: opts.data,
+    });
+  }
+
+  async function sendTaskEvent(
+    fromId: string,
+    taskId: string,
+    intent: string,
+    opts: { text?: string; data?: Record<string, unknown> } = {}
+  ): Promise<{ status: number; data: { event_id?: number; error?: string } }> {
+    return brokerFetch<{ event_id?: number; error?: string }>("/send-task-event", {
+      from_id: fromId,
+      task_id: taskId,
+      intent,
+      text: opts.text,
+      data: opts.data,
+    });
+  }
+
+  async function readTaskFile(taskId: string): Promise<string> {
+    const filePath = path.join(TASKS_DIR, `${taskId}.md`);
+    return fs.readFileSync(filePath, "utf8");
+  }
+
+  // ---- D: Dispatch ----
+
+  test("D1: dispatch_task happy path with peer_id participants", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+
+    const { status, data } = await dispatchTask(a.id, [b.id, c.id], {
+      title: "test",
+      text: "go",
+    });
+    expect(status).toBe(200);
+    const resp = data as DispatchResp;
+    expect(resp.task_id).toMatch(/^T-\d+$/);
+    expect(resp.participants.sort()).toEqual([a.id, b.id, c.id].sort());
+    expect(typeof resp.event_id).toBe("number");
+
+    const db = new Database(TEST_DB, { readonly: true });
+    try {
+      const taskRow = db.query("SELECT * FROM tasks WHERE id = ?").get(resp.task_id) as {
+        state: string;
+        title: string;
+        created_by: string;
+      };
+      expect(taskRow.state).toBe("open");
+      expect(taskRow.title).toBe("test");
+      expect(taskRow.created_by).toBe(a.id);
+
+      const partRows = db.query(
+        "SELECT peer_id, role_at_join FROM task_participants WHERE task_id = ?"
+      ).all(resp.task_id) as Array<{ peer_id: string; role_at_join: string | null }>;
+      expect(partRows.length).toBe(3);
+      const byPeer = Object.fromEntries(partRows.map((r) => [r.peer_id, r.role_at_join]));
+      expect(byPeer[a.id]).toBe("dispatcher");
+
+      const evtRows = db.query(
+        "SELECT intent, from_id, text FROM task_events WHERE task_id = ? ORDER BY id"
+      ).all(resp.task_id) as Array<{ intent: string; from_id: string; text: string }>;
+      expect(evtRows.length).toBe(1);
+      expect(evtRows[0]!.intent).toBe("dispatch");
+      expect(evtRows[0]!.from_id).toBe(a.id);
+    } finally {
+      db.close();
+    }
+
+    const fileContents = await readTaskFile(resp.task_id);
+    expect(fileContents).toContain(`# ${resp.task_id}`);
+    expect(fileContents).toContain("## Events");
+    expect(fileContents).toContain("dispatch");
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("D2: dispatch_task resolves role-name participant", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const d = await registerPeer({ summary: "D", role: "reviewer-slice4" });
+
+    const { data } = await dispatchTask(a.id, ["reviewer-slice4"]);
+    const resp = data as DispatchResp;
+    expect(resp.participants).toContain(d.id);
+    expect(resp.participants).not.toContain("reviewer-slice4");
+
+    await brokerFetch("/unregister", { id: a.id });
+    await brokerFetch("/unregister", { id: d.id });
+    await killPeer(a.proc);
+    await killPeer(d.proc);
+  });
+
+  test("D3: dispatch_task with zero-holder role → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const { status, data } = await dispatchTask(a.id, ["nonexistent-role"]);
+    expect(status).toBe(400);
+    expect((data as { error: string }).error).toContain("nonexistent-role");
+
+    await brokerFetch("/unregister", { id: a.id });
+    await killPeer(a.proc);
+  });
+
+  test("D5: dispatch_task with empty participants → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const { status } = await dispatchTask(a.id, []);
+    expect(status).toBe(400);
+
+    await brokerFetch("/unregister", { id: a.id });
+    await killPeer(a.proc);
+  });
+
+  test("D6: dispatch_task with inactive from_id → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    // Kill A's sleeper so its process is gone, then force inline mark-dead
+    // via a /list-peers call.
+    await killPeer(a.proc);
+    await brokerFetch("/list-peers", { scope: "machine", cwd: "/", git_root: null });
+
+    const { status } = await dispatchTask(a.id, [b.id]);
+    expect(status).toBe(400);
+
+    await brokerFetch("/unregister", { id: b.id });
+    await killPeer(b.proc);
+  });
+
+  test("D7: dispatch_task generates sequential T-<n> ids", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+
+    const r1 = await dispatchTask(a.id, [b.id], { title: "first" });
+    const r2 = await dispatchTask(a.id, [b.id], { title: "second" });
+    const n1 = parseInt((r1.data as DispatchResp).task_id.slice(2), 10);
+    const n2 = parseInt((r2.data as DispatchResp).task_id.slice(2), 10);
+    expect(n2).toBeGreaterThan(n1);
+
+    await brokerFetch("/unregister", { id: a.id });
+    await brokerFetch("/unregister", { id: b.id });
+    await killPeer(a.proc);
+    await killPeer(b.proc);
+  });
+
+  // ---- S: send_task_event ----
+
+  test("S1: send_task_event happy path", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const { status, data } = await sendTaskEvent(b.id, disp.task_id, "state_change", {
+      data: { to: "working" },
+    });
+    expect(status).toBe(200);
+    expect(typeof data.event_id).toBe("number");
+
+    const db = new Database(TEST_DB, { readonly: true });
+    try {
+      const row = db.query("SELECT * FROM task_events WHERE id = ?").get(data.event_id!) as {
+        intent: string;
+        from_id: string;
+        data: string;
+      };
+      expect(row.intent).toBe("state_change");
+      expect(row.from_id).toBe(b.id);
+      expect(row.data).toContain("working");
+    } finally {
+      db.close();
+    }
+
+    const file = await readTaskFile(disp.task_id);
+    expect(file).toMatch(/state_change/);
+
+    await brokerFetch("/unregister", { id: a.id });
+    await brokerFetch("/unregister", { id: b.id });
+    await killPeer(a.proc);
+    await killPeer(b.proc);
+  });
+
+  test("S2: send_task_event from non-participant → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const e = await registerPeer({ summary: "E" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const { status, data } = await sendTaskEvent(e.id, disp.task_id, "state_change", {
+      data: { to: "working" },
+    });
+    expect(status).toBe(400);
+    expect(data.error).toMatch(/participant/i);
+
+    for (const p of [a, b, e]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("S3: send_task_event with invalid intent → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const { status } = await sendTaskEvent(b.id, disp.task_id, "bogus", { text: "x" });
+    expect(status).toBe(400);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("S4: send_task_event with intent=dispatch → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const { status } = await sendTaskEvent(b.id, disp.task_id, "dispatch", { text: "x" });
+    expect(status).toBe(400);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("S5: send_task_event with empty text+data → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const { status } = await sendTaskEvent(b.id, disp.task_id, "state_change");
+    expect(status).toBe(400);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("S6: send_task_event with unknown task_id → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const { status } = await sendTaskEvent(a.id, "T-999999", "state_change", {
+      data: { to: "x" },
+    });
+    expect(status).toBe(400);
+
+    await brokerFetch("/unregister", { id: a.id });
+    await killPeer(a.proc);
+  });
+
+  // ---- P: Poll / long-poll integration ----
+
+  interface PollRespEvent {
+    event_id: number;
+    type: "message" | "task_event";
+    payload: { id: number; task_id?: string; intent?: string; text?: string };
+  }
+
+  test("P1: poll returns task_events for participant", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await dispatchTask(a.id, [b.id]);
+
+    const { data } = await brokerFetch<{
+      events: PollRespEvent[];
+      next_cursor: number | null;
+    }>("/poll-messages", { id: b.id, wait_ms: 0 });
+    const typed = data.events.filter((e) => e.type === "task_event");
+    expect(typed.length).toBe(1);
+    expect(typed[0]!.payload.intent).toBe("dispatch");
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("P2: poll skips task_events for non-participant", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    await dispatchTask(a.id, [b.id]);
+
+    const { data } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: c.id,
+      wait_ms: 0,
+    });
+    const typed = data.events.filter((e) => e.type === "task_event");
+    expect(typed.length).toBe(0);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("P3: long-poll waiter resolves on task_event arrival", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+
+    const pollPromise = brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 5000,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const t0 = Date.now();
+    await dispatchTask(a.id, [b.id]);
+    const { data } = await pollPromise;
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(500);
+    const typed = data.events.filter((e) => e.type === "task_event");
+    expect(typed.length).toBe(1);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("P4: cursor advances past delivered events", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await dispatchTask(a.id, [b.id]);
+
+    // First poll consumes the dispatch event
+    await brokerFetch("/poll-messages", { id: b.id, wait_ms: 0 });
+    // Second poll should be empty (cursor is past)
+    const { data } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 0,
+    });
+    const typed = data.events.filter((e) => e.type === "task_event");
+    expect(typed.length).toBe(0);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("P5: sender does NOT receive their own task_event", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await dispatchTask(a.id, [a.id, b.id]);
+
+    const { data } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: a.id,
+      wait_ms: 0,
+    });
+    const typed = data.events.filter((e) => e.type === "task_event");
+    expect(typed.length).toBe(0);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("P6: mixed batch returns both messages and task_events", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await brokerFetch("/send-message", { from_id: a.id, to_id: b.id, text: "msg" });
+    await dispatchTask(a.id, [b.id]);
+
+    const { data } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 0,
+    });
+    const kinds = new Set(data.events.map((e) => e.type));
+    expect(kinds.has("message")).toBe(true);
+    expect(kinds.has("task_event")).toBe(true);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  // ---- F: Filesystem ----
+
+  test("F1: dispatch creates task file with header", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id], {
+      title: "scaffold",
+      text: "go do it",
+    })).data as DispatchResp;
+
+    const file = await readTaskFile(disp.task_id);
+    expect(file).toContain(`# ${disp.task_id}`);
+    expect(file).toMatch(/state:\s*open/);
+    expect(file).toContain("participants:");
+    expect(file).toContain("## Events");
+    expect(file).toMatch(/### .+ dispatch/);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("F2: send_task_event appends event section", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+    await sendTaskEvent(b.id, disp.task_id, "state_change", { data: { to: "working" } });
+
+    const file = await readTaskFile(disp.task_id);
+    const sections = file.split(/^###\s/m).slice(1); // drop the header chunk
+    expect(sections.length).toBeGreaterThanOrEqual(2);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("F3: fs write failure does not block handler (chmod ro tasks dir)", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const filePath = path.join(TASKS_DIR, `${disp.task_id}.md`);
+    fs.chmodSync(filePath, 0o400);
+    try {
+      const { status, data } = await sendTaskEvent(b.id, disp.task_id, "state_change", {
+        data: { to: "working" },
+      });
+      expect(status).toBe(200);
+      expect(typeof data.event_id).toBe("number");
+    } finally {
+      fs.chmodSync(filePath, 0o600);
+    }
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("F4: task files live under ~/.claude-peers/tasks/", () => {
+    expect(fs.existsSync(TASKS_DIR)).toBe(true);
+  });
+
+  test("F5: renderTaskFile is a pure function of DB state (slice-7 preview)", async () => {
+    // This test imports the render module directly and feeds it DB-shaped
+    // inputs. Lock in: output matches what the broker wrote to disk on dispatch.
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id], {
+      title: "render-test",
+      text: "pure",
+    })).data as DispatchResp;
+
+    const db = new Database(TEST_DB, { readonly: true });
+    const task = db.query("SELECT * FROM tasks WHERE id = ?").get(disp.task_id);
+    const parts = db.query("SELECT * FROM task_participants WHERE task_id = ?").all(disp.task_id);
+    const events = db.query("SELECT * FROM task_events WHERE task_id = ? ORDER BY id").all(disp.task_id);
+    db.close();
+
+    const render = await import("./shared/render.ts");
+    const rendered = render.renderTaskFile(task as Parameters<typeof render.renderTaskFile>[0], parts as Parameters<typeof render.renderTaskFile>[1], events as Parameters<typeof render.renderTaskFile>[2]);
+    const onDisk = await readTaskFile(disp.task_id);
+    expect(rendered).toBe(onDisk);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("F7: fs write failure after DB insert preserves DB row", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const filePath = path.join(TASKS_DIR, `${disp.task_id}.md`);
+    fs.chmodSync(filePath, 0o400);
+    try {
+      const { data } = await sendTaskEvent(b.id, disp.task_id, "state_change", {
+        data: { to: "working" },
+      });
+      const db = new Database(TEST_DB, { readonly: true });
+      try {
+        const row = db.query("SELECT id FROM task_events WHERE id = ?").get(data.event_id!) as
+          | { id: number }
+          | null;
+        expect(row).not.toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      fs.chmodSync(filePath, 0o600);
+    }
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  // ---- R: Role resolution ----
+
+  test("R1: role resolves to live peer", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const d = await registerPeer({ summary: "D", role: "r1-role" });
+    const { data } = await dispatchTask(a.id, ["r1-role"]);
+    expect((data as DispatchResp).participants).toContain(d.id);
+
+    await brokerFetch("/unregister", { id: a.id });
+    await brokerFetch("/unregister", { id: d.id });
+    await killPeer(a.proc);
+    await killPeer(d.proc);
+  });
+
+  test("R2: role released between list_peers and dispatch → 400", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const d = await registerPeer({ summary: "D", role: "r2-role" });
+    await brokerFetch("/set-role", { id: d.id, role: null });
+    const { status, data } = await dispatchTask(a.id, ["r2-role"]);
+    expect(status).toBe(400);
+    expect((data as { error: string }).error).toContain("r2-role");
+
+    await brokerFetch("/unregister", { id: a.id });
+    await brokerFetch("/unregister", { id: d.id });
+    await killPeer(a.proc);
+    await killPeer(d.proc);
+  });
+
+  test("R3: role rebind — revived peer inherits task participation", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const d = await registerPeer({ summary: "D", role: "r3-role" });
+    const disp = (await dispatchTask(a.id, ["r3-role"])).data as DispatchResp;
+    expect(disp.participants).toContain(d.id);
+
+    // D dies; a new session F registers with the same role → inherits D's id
+    await brokerFetch("/unregister", { id: d.id });
+    await killPeer(d.proc);
+
+    const f = await registerPeer({ summary: "F revived", role: "r3-role" });
+    expect(f.id).toBe(d.id); // revive path returns the prior dead row's id
+
+    // F (== old D) is still a participant on the old task — verify via DB
+    const db = new Database(TEST_DB, { readonly: true });
+    try {
+      const row = db.query(
+        "SELECT peer_id FROM task_participants WHERE task_id = ? AND peer_id = ?"
+      ).get(disp.task_id, f.id) as { peer_id: string } | null;
+      expect(row).not.toBeNull();
+    } finally {
+      db.close();
+    }
+
+    await brokerFetch("/unregister", { id: a.id });
+    await brokerFetch("/unregister", { id: f.id });
+    await killPeer(a.proc);
+    await killPeer(f.proc);
+  });
+
+  test("R4: role held only by dead peer → 400 with dead-holder message", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const d = await registerPeer({ summary: "D", role: "r4-role" });
+
+    // Kill D's process + flush with /list-peers, but do NOT /unregister (so
+    // the row stays, just flips to dead).
+    await killPeer(d.proc);
+    await brokerFetch("/list-peers", { scope: "machine", cwd: "/", git_root: null });
+
+    const { status, data } = await dispatchTask(a.id, ["r4-role"]);
+    expect(status).toBe(400);
+    expect((data as { error: string }).error).toMatch(/r4-role/);
+
+    await brokerFetch("/unregister", { id: a.id });
+    await killPeer(a.proc);
+  });
+
+  test("R5: cleanStalePeers mid-dispatch does not corrupt task creation", async () => {
+    // In the real broker, cleanStalePeers is a setInterval. This test doesn't
+    // trigger it directly — instead it asserts that back-to-back dispatch
+    // calls around a /list-peers (which also marks stale) produce consistent
+    // state. If the race existed, we'd see orphan task_participants rows.
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+
+    const disp1 = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+    await brokerFetch("/list-peers", { scope: "machine", cwd: "/", git_root: null });
+    const disp2 = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+
+    const db = new Database(TEST_DB, { readonly: true });
+    try {
+      for (const tid of [disp1.task_id, disp2.task_id]) {
+        const parts = db.query(
+          "SELECT peer_id FROM task_participants WHERE task_id = ?"
+        ).all(tid) as { peer_id: string }[];
+        const ids = parts.map((p) => p.peer_id).sort();
+        expect(ids).toEqual([a.id, b.id].sort());
+      }
+    } finally {
+      db.close();
+    }
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  // ---- C: Cursor semantics ----
+
+  test("C1: new peer starts with cursor=0 and only receives events they participate in", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await dispatchTask(a.id, [b.id]);
+
+    // A fresh peer C registers — cursor starts at 0 but they are not a
+    // participant on the earlier task, so they see nothing.
+    const c = await registerPeer({ summary: "C" });
+    const { data } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: c.id,
+      wait_ms: 0,
+    });
+    expect(data.events.filter((e) => e.type === "task_event")).toEqual([]);
+
+    // After dispatching to C, they receive the new event.
+    await dispatchTask(a.id, [c.id]);
+    const { data: data2 } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: c.id,
+      wait_ms: 0,
+    });
+    const typed = data2.events.filter((e) => e.type === "task_event");
+    expect(typed.length).toBe(1);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("C2: cursor advances to max event_id in a multi-event batch", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const disp = (await dispatchTask(a.id, [b.id])).data as DispatchResp;
+    await sendTaskEvent(a.id, disp.task_id, "state_change", { data: { to: "working" } });
+
+    // B's single poll picks up both events
+    const { data } = await brokerFetch<{ events: PollRespEvent[]; next_cursor: number | null }>(
+      "/poll-messages",
+      { id: b.id, wait_ms: 0 }
+    );
+    const taskEvents = data.events.filter((e) => e.type === "task_event");
+    expect(taskEvents.length).toBe(2);
+
+    // Next poll should be empty (cursor advanced past both)
+    const { data: data2 } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 0,
+    });
+    expect(data2.events.filter((e) => e.type === "task_event")).toEqual([]);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("C3: concurrent task_event inserts both reach polling peer", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const c = await registerPeer({ summary: "C" });
+    const disp = (await dispatchTask(a.id, [b.id, c.id])).data as DispatchResp;
+
+    // C drains the dispatch event so its cursor is caught up.
+    await brokerFetch("/poll-messages", { id: c.id, wait_ms: 0 });
+
+    // A and B fire events concurrently.
+    await Promise.all([
+      sendTaskEvent(a.id, disp.task_id, "state_change", { data: { to: "working" } }),
+      sendTaskEvent(b.id, disp.task_id, "question", { text: "q?" }),
+    ]);
+
+    // C polls, possibly twice, to collect both.
+    const seen: number[] = [];
+    for (let i = 0; i < 3 && seen.length < 2; i++) {
+      const { data } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+        id: c.id,
+        wait_ms: 200,
+      });
+      for (const e of data.events.filter((e) => e.type === "task_event")) {
+        seen.push(e.event_id);
+      }
+    }
+    expect(seen.length).toBe(2);
+
+    for (const p of [a, b, c]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("C4: cursor advances exactly once per event (no duplicate delivery)", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    await dispatchTask(a.id, [b.id]);
+    await brokerFetch("/poll-messages", { id: b.id, wait_ms: 0 });
+    const { data } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 0,
+    });
+    expect(data.events.filter((e) => e.type === "task_event")).toEqual([]);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  test("C5: cursor write and waiter resolve are paired", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+
+    // B installs a long-poll; A dispatches; B's poll resolves.
+    const pollPromise = brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 5000,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    await dispatchTask(a.id, [b.id]);
+    const { data } = await pollPromise;
+    expect(data.events.filter((e) => e.type === "task_event").length).toBe(1);
+
+    // Immediate second poll must be empty — cursor was advanced as part of
+    // the resolve, not on the next poll.
+    const { data: data2 } = await brokerFetch<{ events: PollRespEvent[] }>("/poll-messages", {
+      id: b.id,
+      wait_ms: 0,
+    });
+    expect(data2.events.filter((e) => e.type === "task_event")).toEqual([]);
+
+    for (const p of [a, b]) {
+      await brokerFetch("/unregister", { id: p.id });
+      await killPeer(p.proc);
+    }
+  });
+
+  // F6 runs LAST in the slice-4 describe because it kills the broker and
+  // respawns it (like T8). Later tests in the describe must not depend on
+  // broker state that F6 disrupts; T8 (in the final describe) does its own
+  // kill+respawn and tolerates restarts.
+  test("F6: broker crash mid-slice-4 recovers cleanly (existing file survives)", async () => {
+    const a = await registerPeer({ summary: "A" });
+    const b = await registerPeer({ summary: "B" });
+    const dispResp = await dispatchTask(a.id, [b.id]);
+    // In failing baseline, dispatch returns 4xx; skip the crash+restore dance
+    // so subsequent tests in the same run (and afterAll teardown) aren't
+    // affected. This preserves deterministic failure semantics: the test
+    // fails on the dispatch assertion rather than cascading via a dead broker.
+    expect(dispResp.status).toBe(200);
+    const disp = dispResp.data as DispatchResp;
+
+    brokerProc.kill();
+    await brokerProc.exited;
+
+    brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_PORT: String(TEST_PORT),
+        CLAUDE_PEERS_DB: TEST_DB,
+        CLAUDE_PEERS_HOME: TEST_HOME,
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let ready = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        const res = await fetch(`${BROKER_URL}/health`);
+        if (res.ok) { ready = true; break; }
+      } catch { /* not yet */ }
+    }
+    expect(ready).toBe(true);
+
+    const fileAfter = await readTaskFile(disp.task_id);
+    expect(fileAfter).toContain(`# ${disp.task_id}`);
+    expect(fileAfter).toContain("dispatch");
+
+    await killPeer(a.proc);
+    await killPeer(b.proc);
   });
 });
 
