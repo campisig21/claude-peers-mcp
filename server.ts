@@ -369,24 +369,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
-          ];
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
-          return parts.join("\n  ");
+        // Role-first sort: peers with roles sorted alphabetically by role,
+        // roleless peers last (by id). Keeps the mesh structure legible.
+        const sorted = [...peers].sort((a, b) => {
+          if (a.role && b.role) return a.role.localeCompare(b.role);
+          if (a.role && !b.role) return -1;
+          if (!a.role && b.role) return 1;
+          return a.id.localeCompare(b.id);
+        });
+
+        const lines = sorted.map((p) => {
+          const tag = p.role ? `[${p.role}]` : "(no role)";
+          const summary = p.summary ? `  — ${p.summary}` : "";
+          return `${tag} ${p.id}  ${p.cwd}${summary}`;
         });
 
         return {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
+              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n")}`,
             },
           ],
         };
