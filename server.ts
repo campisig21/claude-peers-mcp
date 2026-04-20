@@ -841,6 +841,12 @@ async function pollAndPushMessages() {
         // Slice 4: typed event notification. Thin envelope per D8 — no
         // from_summary/from_cwd. Receiver can Read the task file or call
         // list_peers if they want more context.
+        //
+        // Slice 5: respect the broker's shouldPush decision. push=false
+        // means the event was delivered (included in the poll batch,
+        // cursor advanced) but should not fire a channel notification —
+        // it's audit-in-state-only. Absence of the field is treated as
+        // push=true for backwards-compat with slice-4 producers.
         const te = event.payload as {
           id: number;
           task_id: string;
@@ -850,6 +856,10 @@ async function pollAndPushMessages() {
           data: string | null;
           sent_at: string;
         };
+        if (event.push === false) {
+          log(`Suppressed task_event ${te.id} (${te.intent}) on ${te.task_id} — shouldPush=false`);
+          continue;
+        }
         const preview = te.text ? te.text.slice(0, 80) : "";
         const content = `[task ${te.task_id}] ${te.intent} from ${te.from_id}${preview ? ": " + preview : ""}`;
 

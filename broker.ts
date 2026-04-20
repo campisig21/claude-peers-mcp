@@ -36,6 +36,7 @@ import type {
 } from "./shared/types.ts";
 import { formatTaskId, parseTaskId } from "./shared/task-ids.ts";
 import { renderTaskFile, renderTaskEvent } from "./shared/render.ts";
+import { shouldPush } from "./shared/push-policy.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
@@ -384,6 +385,17 @@ const selectTaskEventsSincePeer = db.prepare(`
   ORDER BY te.id ASC
 `);
 
+// Slice 5: same as selectTaskEventsSincePeer but also projects the polling
+// peer's role_at_join so shouldPush can apply rule 1 (observer) without a
+// second per-event SELECT. role_at_join is broker-internal — stripped from
+// the TaskEvent payload before wire serialization.
+const selectTaskEventsSincePeerWithRole = db.prepare(`
+  SELECT te.*, tp.role_at_join AS _role_at_join FROM task_events te
+  INNER JOIN task_participants tp ON tp.task_id = te.task_id
+  WHERE tp.peer_id = ? AND te.id > ? AND te.from_id != ?
+  ORDER BY te.id ASC
+`);
+
 const selectTaskEventCursor = db.prepare(`
   SELECT last_event_id FROM task_event_cursors WHERE peer_id = ?
 `);
@@ -690,6 +702,15 @@ function buildRoleLookup(): (peer_id: string) => string | null {
 // lookup here either returns zero or one row; ambiguity is structurally
 // prevented upstream. If you're reading this later and considering
 // relaxing that invariant, you'll need to add tiebreak logic here.
+//
+// Precedence (M3, slice-5 follow-up): peer_id match is attempted FIRST,
+// role lookup falls through. If a role name happens to collide with an
+// existing peer_id string, the peer_id match wins — the request would
+// be targeting that specific peer, not the role holder. In practice
+// peer IDs use a bounded adjective-noun format (e.g. "swift-otter") and
+// role names are typically longer slash-separated paths (e.g.
+// "multi-agent/reviewer-backend-A"), so collisions are effectively
+// impossible — but the precedence is deterministic if one ever arises.
 function resolveParticipants(raw: string[]): PeerId[] {
   const resolved: PeerId[] = [];
   for (const entry of raw) {
@@ -783,14 +804,22 @@ async function appendTaskEventFile(
 // this in. The cursor upsert is synchronous (bun:sqlite is sync) and no
 // await sits between the upsert and the resolve call, so the next poll
 // from this peer cannot see the event as unread.
-function deliverTaskEventToPeer(peerId: PeerId, event: PeerEvent<TaskEvent>): void {
-  const waiter = pendingWaiters.get(peerId);
+//
+// Slice 5: push flag is computed here from the receiver's task_participants
+// row (passed in by caller). The envelope's push field is always set
+// explicitly — matches D4's always-explicit discipline.
+function deliverTaskEventToPeer(
+  receiver: TaskParticipant,
+  event: PeerEvent<TaskEvent>
+): void {
+  const waiter = pendingWaiters.get(receiver.peer_id);
   if (!waiter) return;
   clearTimeout(waiter.timeoutHandle);
-  pendingWaiters.delete(peerId);
-  upsertTaskEventCursor.run(peerId, event.event_id);
+  pendingWaiters.delete(receiver.peer_id);
+  upsertTaskEventCursor.run(receiver.peer_id, event.event_id);
+  const push = shouldPush(event.payload, receiver);
   waiter.resolve({
-    events: [event],
+    events: [{ ...event, push }],
     next_cursor: event.event_id,
   });
 }
@@ -812,8 +841,17 @@ async function handleDispatchTask(
   if (!body.title || typeof body.title !== "string") {
     throw new BadRequestError("title is required");
   }
-  if (!Array.isArray(body.participants) || body.participants.length === 0) {
-    throw new BadRequestError("participants must be a non-empty array");
+  if (!Array.isArray(body.participants)) {
+    throw new BadRequestError("participants must be an array");
+  }
+  // Slice 5: participants[] alone OR observers[] alone is acceptable.
+  // The combined set must be non-empty — dispatching to yourself is not
+  // a task, it's a note-to-self.
+  const observerCount = Array.isArray(body.observers) ? body.observers.length : 0;
+  if (body.participants.length === 0 && observerCount === 0) {
+    throw new BadRequestError(
+      "at least one participant or observer is required"
+    );
   }
   const fromActive = db.query(
     "SELECT id FROM peers WHERE id = ? AND status = 'active'"
@@ -823,10 +861,20 @@ async function handleDispatchTask(
   }
 
   const resolved = resolveParticipants(body.participants);
-  // Ensure the dispatcher is in the participants set. If they omitted
-  // themselves, insert at position 0.
+  // Slice 5: observers overlay — resolved separately, same peer_id /
+  // role-name mixing allowed. Observers overlay the participants set:
+  // any id listed as observer gets role_at_join='observer'. Dispatcher
+  // role wins over observer if from_id is in both.
+  const resolvedObservers = body.observers
+    ? new Set(resolveParticipants(body.observers))
+    : new Set<PeerId>();
+
+  // Ensure the dispatcher is in the participants set.
   const participantsSet = new Set<PeerId>(resolved);
   participantsSet.add(body.from_id);
+  // Observers are also participants (so they appear in task_participants
+  // and receive delivery). Merge them in.
+  for (const o of resolvedObservers) participantsSet.add(o);
   const allParticipants = Array.from(participantsSet);
 
   const now = new Date().toISOString();
@@ -848,7 +896,12 @@ async function handleDispatchTask(
     taskId = generateTaskId();
     insertTask.run(taskId, body.context_id ?? null, body.title, now, body.from_id);
     for (const p of allParticipants) {
-      const role = p === body.from_id ? "dispatcher" : null;
+      // Dispatcher wins: from_id is 'dispatcher' even if they appear in
+      // observers. Non-dispatcher + observer-listed → 'observer'. Else null.
+      let role: string | null;
+      if (p === body.from_id) role = "dispatcher";
+      else if (resolvedObservers.has(p)) role = "observer";
+      else role = null;
       insertTaskParticipant.run(taskId, p, role, now);
     }
     const evRes = insertTaskEvent.run(
@@ -872,11 +925,12 @@ async function handleDispatchTask(
   // errors internally (logs to stderr).
   await writeDispatchFile(taskRow, participantRows, [eventRow]);
 
-  // Resolve waiters for all non-sender participants (slice 4: sender never
-  // receives their own event; slice 5 adds the full shouldPush filter).
+  // Resolve waiters for all non-sender participants. Slice 5 passes the
+  // full participant row to deliverTaskEventToPeer so shouldPush can
+  // read role_at_join.
   const envelope = formatEventEnvelope(eventRow);
-  for (const p of allParticipants) {
-    if (p === body.from_id) continue;
+  for (const p of participantRows) {
+    if (p.peer_id === body.from_id) continue;
     deliverTaskEventToPeer(p, envelope);
   }
 
@@ -954,7 +1008,7 @@ async function handleSendTaskEvent(
   const envelope = formatEventEnvelope(eventRow);
   for (const p of participants) {
     if (p.peer_id === body.from_id) continue;
-    deliverTaskEventToPeer(p.peer_id, envelope);
+    deliverTaskEventToPeer(p, envelope);
   }
 
   return { event_id: eventId };
@@ -992,8 +1046,12 @@ function handlePollMessages(body: PollMessagesRequest): Promise<PollMessagesResp
     ? (selectTaskEventCursor.get(id) as { last_event_id: number } | null)
     : null;
   const taskCursor = cursorRow?.last_event_id ?? 0;
+  // Slice 5: JOIN'd query pulls the polling peer's role_at_join for
+  // shouldPush rule 1. `_role_at_join` is broker-internal and is not
+  // emitted on the wire — stripped before push into the envelope.
+  type TaskEventWithRole = TaskEvent & { _role_at_join: string | null };
   const pendingTaskEvents = since_id === undefined
-    ? (selectTaskEventsSincePeer.all(id, taskCursor, id) as TaskEvent[])
+    ? (selectTaskEventsSincePeerWithRole.all(id, taskCursor, id) as TaskEventWithRole[])
     : [];
 
   const totalCount = pendingMessages.length + pendingTaskEvents.length;
@@ -1003,11 +1061,20 @@ function handlePollMessages(body: PollMessagesRequest): Promise<PollMessagesResp
     }
 
     const events: PeerEvent<Message | TaskEvent>[] = [];
+    // D4: always set push explicitly on slice-5+ events. Message events
+    // always push: true (existing behavior). Task events apply shouldPush.
     for (const m of pendingMessages) {
-      events.push({ event_id: m.id, type: "message", payload: m });
+      events.push({ event_id: m.id, type: "message", payload: m, push: true });
     }
-    for (const te of pendingTaskEvents) {
-      events.push({ event_id: te.id, type: "task_event", payload: te });
+    for (const teWithRole of pendingTaskEvents) {
+      const { _role_at_join, ...te } = teWithRole;
+      const push = shouldPush(te, {
+        task_id: te.task_id,
+        peer_id: id,
+        role_at_join: _role_at_join as TaskParticipant["role_at_join"],
+        joined_at: "",
+      });
+      events.push({ event_id: te.id, type: "task_event", payload: te, push });
     }
 
     // Advance task_event_cursor to the max task_event id we just delivered.
