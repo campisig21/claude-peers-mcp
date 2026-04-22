@@ -283,6 +283,12 @@ async function checkBrokerVersion(): Promise<void> {
   try {
     await healInProgress;
     brokerVersionWarned = false;
+    // Reset cooldown on SUCCESS so a second legitimate mismatch (e.g.,
+    // another session respawned an old broker within 10s) isn't silenced
+    // by the rate-limit. The cooldown exists to prevent tight FAIL loops;
+    // a successful heal is not something to rate-limit against. Failed
+    // heals leave lastHealAttempt at `now` and correctly cool down.
+    lastHealAttempt = 0;
   } catch (e) {
     log(`Auto-heal failed: ${e instanceof Error ? e.message : String(e)}`);
   } finally {
