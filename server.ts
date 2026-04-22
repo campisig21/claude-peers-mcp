@@ -160,28 +160,133 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
-async function checkBrokerVersion(): Promise<void> {
+type HealthResponse = {
+  status: string;
+  peers: number;
+  version?: string;
+  pid?: number;
+};
+
+async function fetchHealth(): Promise<HealthResponse | null> {
   try {
     const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    if (!res.ok) return;
-    const data = await res.json() as { status: string; peers: number; version?: string };
-    if (!data.version) {
-      if (!brokerVersionWarned) {
-        log("WARNING: broker /health has no version field — daemon predates version check");
-        brokerVersionWarned = true;
-      }
-      return;
-    }
-    if (data.version !== EXPECTED_BROKER_VERSION) {
-      if (!brokerVersionWarned) {
-        log(`WARNING: broker version mismatch — running=${data.version} disk=${EXPECTED_BROKER_VERSION}. Broker daemon is stale.`);
-        brokerVersionWarned = true;
-      }
-    } else {
-      brokerVersionWarned = false; // Reset if versions match (e.g. after a restart healed it)
-    }
+    if (!res.ok) return null;
+    return (await res.json()) as HealthResponse;
   } catch {
-    // Non-critical
+    return null;
+  }
+}
+
+// Kill a stale broker and respawn from disk. Concurrency model: each session
+// arrives here independently (no cross-session lock). Safety comes from a
+// compare-and-swap re-verify right before SIGTERM — we refetch /health and
+// only kill if (a) the broker is still stale AND (b) its pid is still the
+// one we originally diagnosed. If another session healed in the meantime,
+// the second check fails and we abort cleanly. The local healInProgress
+// mutex and HEAL_COOLDOWN_MS gate remain in force to dedupe within a single
+// session.
+//
+// In-flight long-polls: SIGTERM causes Bun.serve to close listening sockets,
+// giving connected clients ECONNRESET on their pending requests. The poll
+// driver loop treats that as a connection error, calls attemptSelfHeal via
+// brokerFetch, and reconnects to the respawned broker. Recovery window is
+// typically ~1s (measured empirically on 2026-04-22 when this scenario was
+// first hit manually).
+async function healStaleBroker(expectedStalePid: number): Promise<void> {
+  // CAS re-verify. If version now matches or pid rotated, someone else
+  // already healed — do nothing. This is what makes N concurrent heal
+  // attempts safe without a shared lockfile.
+  const pre = await fetchHealth();
+  if (!pre) {
+    // Broker is down — let ensureBroker handle the respawn path.
+    log("Broker unreachable during heal check; respawning");
+    await ensureBroker();
+    return;
+  }
+  if (pre.version === EXPECTED_BROKER_VERSION) {
+    log("Broker already healed by another session; skipping");
+    return;
+  }
+  if (pre.pid !== expectedStalePid) {
+    log(`Broker pid rotated (${expectedStalePid} -> ${pre.pid}); skipping kill`);
+    return;
+  }
+
+  log(`Killing stale broker pid=${expectedStalePid} (running=${pre.version} disk=${EXPECTED_BROKER_VERSION})`);
+  try {
+    process.kill(expectedStalePid, "SIGTERM");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // ESRCH = already dead; benign race. Anything else is worth logging.
+    if (!msg.includes("ESRCH") && !msg.includes("no such process")) {
+      log(`Kill failed: ${msg}`);
+    }
+  }
+  // Wait for the port to actually free. 20 × 150ms = 3s cap; typical
+  // shutdown on Bun.serve is sub-100ms.
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 150));
+    if (!(await isBrokerAlive())) break;
+  }
+  await ensureBroker();
+  log("Stale-broker heal complete");
+}
+
+async function checkBrokerVersion(): Promise<void> {
+  const data = await fetchHealth();
+  if (!data) return;
+
+  if (!data.version) {
+    // Pre-version-fingerprint daemon. We can't diagnose staleness without
+    // the fingerprint field, and we don't have a trustworthy pid to target
+    // the kill (pid field was added in the same patch as version). Log
+    // once and require human intervention for this one-shot migration path.
+    if (!brokerVersionWarned) {
+      log("WARNING: broker /health has no version field — daemon predates version check. Manual restart required.");
+      brokerVersionWarned = true;
+    }
+    return;
+  }
+
+  if (data.version === EXPECTED_BROKER_VERSION) {
+    brokerVersionWarned = false;
+    return;
+  }
+
+  // Version mismatch: running broker is stale relative to disk. Attempt
+  // auto-heal, gated by the shared in-session cooldown + mutex so a burst
+  // of mismatches (e.g., if checkBrokerVersion fires during poll error
+  // retries) doesn't stack up kill+respawn cycles.
+  const now = Date.now();
+  if (now - lastHealAttempt < HEAL_COOLDOWN_MS) {
+    if (!brokerVersionWarned) {
+      log(`Broker version mismatch (running=${data.version} disk=${EXPECTED_BROKER_VERSION}); heal cooldown active, will retry after ${Math.ceil((HEAL_COOLDOWN_MS - (now - lastHealAttempt)) / 1000)}s`);
+      brokerVersionWarned = true;
+    }
+    return;
+  }
+  if (healInProgress) {
+    try { await healInProgress; } catch { /* ignore — next check will retry */ }
+    return;
+  }
+  if (!data.pid) {
+    // Version present but pid missing: shouldn't occur in practice (both
+    // landed in the same patch), but defensively handle it rather than
+    // sending SIGTERM to a pid we can't trust.
+    log(`Broker has version but no pid field — can't target kill. Manual restart required.`);
+    return;
+  }
+
+  log(`Broker version mismatch — triggering auto-heal (running=${data.version} disk=${EXPECTED_BROKER_VERSION} pid=${data.pid})`);
+  lastHealAttempt = now;
+  healInProgress = healStaleBroker(data.pid);
+  try {
+    await healInProgress;
+    brokerVersionWarned = false;
+  } catch (e) {
+    log(`Auto-heal failed: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    healInProgress = null;
   }
 }
 

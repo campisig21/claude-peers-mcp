@@ -1274,10 +1274,15 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
+        // `pid` lets MCP servers target a kill when auto-healing a stale
+        // broker (version mismatch). Compare-and-swap semantics: clients
+        // re-read pid immediately before SIGTERM so two sessions racing
+        // the heal can't kill the new broker.
         return Response.json({
           status: "ok",
           peers: (selectAllPeers.all() as Peer[]).length,
           version: BROKER_VERSION,
+          pid: process.pid,
         });
       }
       // Debug-only introspection into the long-poll waiter map.
