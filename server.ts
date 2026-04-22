@@ -808,6 +808,7 @@ async function pollAndPushMessages() {
         // Look up the sender's info for channel envelope meta
         let fromSummary = "";
         let fromCwd = "";
+        let fromRole: string | null = null;
         try {
           const peers = await brokerFetch<Peer[]>("/list-peers", {
             scope: "machine",
@@ -818,15 +819,23 @@ async function pollAndPushMessages() {
           if (sender) {
             fromSummary = sender.summary;
             fromCwd = sender.cwd;
+            fromRole = sender.role;
           }
         } catch {
           // Non-critical, proceed without sender info
         }
 
+        const peerName = fromRole ?? msg.from_id;
+        // Normalize literal-escaped "\n" sequences (two chars) into real
+        // newlines so paragraph breaks render on the receiver.
+        const normalizedText = msg.text.replace(/\\n/g, "\n");
+        const formattedContent = `claude peers (${peerName}) -> ${normalizedText}`;
+
+        // meta is Record<string, string>; a null value silently drops the whole notification on the receiver. New string-valued keys are fine — they render as <channel> tag attributes.
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
-            content: msg.text,
+            content: formattedContent,
             meta: {
               from_id: msg.from_id,
               from_summary: fromSummary,
